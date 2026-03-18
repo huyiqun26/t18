@@ -1,0 +1,49 @@
+name: Build Linux ARM64 Final
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build on ARM64 Container
+        uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64
+          distro: ubuntu22.04
+          githubToken: ${{ github.token }}
+          
+          run: |
+            # 1. 安装 ARM 系统底层依赖
+            apt-get update
+            apt-get install -y python3-pip python3-dev binutils libatomic1
+            
+            # 2. 升级基础环境
+            python3 -m pip install --upgrade pip setuptools wheel
+            
+            # 3. 安装定制的依赖文件
+            pip3 install -r requirements_linux.txt
+            
+            # 4. 安装打包工具
+            pip3 install pyinstaller
+            
+            # 5. 执行正式打包
+            # --collect-all ortools 是为了解决你之前体积只有 50MB 的核心问题
+            pyinstaller --onefile --clean \
+                        --collect-all ortools \
+                        --hidden-import=uvicorn.logging \
+                        --name railway_app_arm64 main.py
+
+      - name: Upload Finished Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: railway-arm64-binary
+          path: dist/railway_app_arm64
