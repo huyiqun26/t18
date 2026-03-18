@@ -1,4 +1,4 @@
-name: Build Linux ARM64 Final
+name: Build Linux ARM64 Final (Conda + Ubuntu 18.04)
 
 on:
   push:
@@ -18,25 +18,32 @@ jobs:
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          # 坚定使用 20.04，完美适配甲方的麒麟 V10
-          distro: ubuntu20.04 
+          # 坚定使用 18.04，确保底层 GLIBC 是 2.27，绝对兼容甲方的 2.28
+          distro: ubuntu18.04 
           githubToken: ${{ github.token }}
           
           run: |
-            # 1. 安装底层编译工具 (修复环境依赖)
+            # 1. 安装 Ubuntu 18.04 基础工具 (不依赖它的老旧 Python)
             apt-get update
-            apt-get install -y python3-pip python3-dev binutils libatomic1 g++ gcc make zlib1g-dev
+            apt-get install -y wget bzip2 binutils libatomic1 g++ gcc make zlib1g-dev
             
-            # 2. 升级基础构建工具
-            python3 -m pip install --upgrade pip setuptools wheel
+            # 2. 下载并静默安装 Miniconda (ARM64 专版)
+            echo "开始安装 Miniconda..."
+            wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh -O miniconda.sh
+            bash miniconda.sh -b -p /opt/conda
             
-            # 3. 安装你的核心算法和接口依赖
-            pip3 install -r requirements_linux.txt
+            # 3. 配置环境变量并强制指定 Python 3.10
+            export PATH="/opt/conda/bin:$PATH"
+            conda install -y python=3.10
             
-            # 4. 安装打包工具
-            pip3 install pyinstaller
+            # 4. 使用纯净的 Python 3.10 环境安装依赖
+            echo "开始安装 Python 依赖..."
+            pip install --upgrade pip
+            pip install -r requirements_linux.txt
+            pip install pyinstaller
             
             # 5. 执行正式打包
+            echo "开始使用 PyInstaller 打包..."
             pyinstaller --onefile --clean \
                         --collect-all ortools \
                         --hidden-import=uvicorn.logging \
