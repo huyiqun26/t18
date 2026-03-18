@@ -18,25 +18,27 @@ jobs:
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          distro: ubuntu22.04
+          # 【关键修改】使用 20.04 解决 GLIBC 版本过高的问题
+          distro: ubuntu20.04 
           githubToken: ${{ github.token }}
           
           run: |
-            # 1. 安装 ARM 系统底层依赖
+            # 1. 安装系统底层依赖
+            # 相比之前，增加了 g++, gcc, make, zlib1g-dev 确保复杂库能安装成功
             apt-get update
-            apt-get install -y python3-pip python3-dev binutils libatomic1
+            apt-get install -y python3-pip python3-dev binutils libatomic1 g++ gcc make zlib1g-dev
             
-            # 2. 升级基础环境
+            # 2. 强制升级 pip 和基础构建工具 (20.04 自带版本较低)
             python3 -m pip install --upgrade pip setuptools wheel
             
-            # 3. 安装定制的依赖文件
+            # 3. 安装你的依赖文件
+            # 如果安装这里报错，请检查 requirements_linux.txt 里是否有不兼容 3.8 的版本号
             pip3 install -r requirements_linux.txt
             
             # 4. 安装打包工具
             pip3 install pyinstaller
             
             # 5. 执行正式打包
-            # --collect-all ortools 是为了解决你之前体积只有 50MB 的核心问题
             pyinstaller --onefile --clean \
                         --collect-all ortools \
                         --hidden-import=uvicorn.logging \
