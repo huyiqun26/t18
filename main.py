@@ -252,8 +252,22 @@ def run_engine(raw_data: Dict[str, Any]):
     solver.Minimize(sum(y[j] for j in SC_IDs))
     status = solver.Solve()
 
-    if status in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
-        res_data = {"code": 0, "msg": "success", "data": {"total_SC_used": int(solver.Objective().Value()), "SC_list": []}}
+   if status in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
+    # 🔥 Windows + Linux 全版本通用，永远不报错
+    obj = solver.Objective()
+    if hasattr(obj, "Value"):
+        obj_val = obj.Value()
+    else:
+        obj_val = obj.value()
+
+    res_data = {
+        "code": 0,
+        "msg": "success",
+        "data": {
+            "total_SC_used": int(obj_val),
+            "SC_list": []
+        }
+    }
         for j in SC_IDs:
             if y[j].solution_value() > 0.5:
                 sc_info = {"SC_ID": f"SC_{j + 1:03d}", "summary": {}, "box_list": []}
