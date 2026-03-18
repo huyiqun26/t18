@@ -1,4 +1,4 @@
-name: Build Linux ARM64 Final (Conda + Ubuntu 18.04)
+name: Build Linux ARM64 Final (Conda + Ubuntu 18.04 Fix)
 
 on:
   push:
@@ -18,25 +18,24 @@ jobs:
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          # 坚定使用 18.04，确保底层 GLIBC 是 2.27，绝对兼容甲方的 2.28
+          # 依然坚守 18.04，确保底层 GLIBC 是 2.27
           distro: ubuntu18.04 
           githubToken: ${{ github.token }}
           
           run: |
-            # 1. 安装 Ubuntu 18.04 基础工具 (不依赖它的老旧 Python)
+            # 1. 安装 Ubuntu 18.04 基础工具
             apt-get update
             apt-get install -y wget bzip2 binutils libatomic1 g++ gcc make zlib1g-dev
             
-            # 2. 下载并静默安装 Miniconda (ARM64 专版)
-            echo "开始安装 Miniconda..."
-            wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh -O miniconda.sh
+            # 2. 【核心修复】下载 2023 年的旧版 Miniconda (自带 Python 3.10，完美兼容 GLIBC 2.27)
+            echo "开始安装旧版 Miniconda..."
+            wget https://repo.anaconda.com/miniconda/Miniconda3-py310_23.1.0-1-Linux-aarch64.sh -O miniconda.sh
             bash miniconda.sh -b -p /opt/conda
             
-            # 3. 配置环境变量并强制指定 Python 3.10
+            # 3. 配置环境变量 (此时系统已经拥有了纯净的 Python 3.10)
             export PATH="/opt/conda/bin:$PATH"
-            conda install -y python=3.10
             
-            # 4. 使用纯净的 Python 3.10 环境安装依赖
+            # 4. 安装依赖
             echo "开始安装 Python 依赖..."
             pip install --upgrade pip
             pip install -r requirements_linux.txt
