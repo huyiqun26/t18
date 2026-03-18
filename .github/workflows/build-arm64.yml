@@ -1,4 +1,4 @@
-name: Build Linux ARM64 Final
+name: Build Linux ARM64 Final (Fixed 20.04 with Python 3.10)
 
 on:
   push:
@@ -18,28 +18,31 @@ jobs:
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          # 【关键修改】使用 20.04 解决 GLIBC 版本过高的问题
-          distro: ubuntu20.04 
+          distro: ubuntu20.04
           githubToken: ${{ github.token }}
           
           run: |
-            # 1. 安装系统底层依赖
-            # 相比之前，增加了 g++, gcc, make, zlib1g-dev 确保复杂库能安装成功
+            # 1. 安装基础工具和 PPA 管理工具
             apt-get update
-            apt-get install -y python3-pip python3-dev binutils libatomic1 g++ gcc make zlib1g-dev
+            apt-get install -y software-properties-common curl binutils libatomic1 g++ gcc make zlib1g-dev
             
-            # 2. 强制升级 pip 和基础构建工具 (20.04 自带版本较低)
-            python3 -m pip install --upgrade pip setuptools wheel
+            # 2. 在 20.04 内部安装 Python 3.10 (解决版本不兼容问题)
+            add-apt-repository ppa:deadsnakes/ppa -y
+            apt-get update
+            apt-get install -y python3.10 python3.10-dev python3.10-distutils
             
-            # 3. 安装你的依赖文件
-            # 如果安装这里报错，请检查 requirements_linux.txt 里是否有不兼容 3.8 的版本号
-            pip3 install -r requirements_linux.txt
+            # 3. 安装并升级 pip
+            curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
+            python3.10 -m pip install --upgrade pip setuptools wheel
             
-            # 4. 安装打包工具
-            pip3 install pyinstaller
+            # 4. 使用 python3.10 安装依赖
+            # 明确指定版本号可以避免由于最新版库不兼容 20.04 导致的问题
+            python3.10 -m pip install -r requirements_linux.txt
+            python3.10 -m pip install pyinstaller
             
             # 5. 执行正式打包
-            pyinstaller --onefile --clean \
+            # 重点：通过 python3.10 -m PyInstaller 调用
+            python3.10 -m PyInstaller --onefile --clean \
                         --collect-all ortools \
                         --hidden-import=uvicorn.logging \
                         --name railway_app_arm64 main.py
