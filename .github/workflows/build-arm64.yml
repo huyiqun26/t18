@@ -1,4 +1,4 @@
-name: Build Linux ARM64 Final (Fixed 20.04 with Python 3.10)
+name: Build Linux ARM64 Final
 
 on:
   push:
@@ -18,31 +18,26 @@ jobs:
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          distro: ubuntu20.04
+          # 坚定使用 20.04，完美适配甲方的麒麟 V10
+          distro: ubuntu20.04 
           githubToken: ${{ github.token }}
           
           run: |
-            # 1. 安装基础工具和 PPA 管理工具
+            # 1. 安装底层编译工具 (修复环境依赖)
             apt-get update
-            apt-get install -y software-properties-common curl binutils libatomic1 g++ gcc make zlib1g-dev
+            apt-get install -y python3-pip python3-dev binutils libatomic1 g++ gcc make zlib1g-dev
             
-            # 2. 在 20.04 内部安装 Python 3.10 (解决版本不兼容问题)
-            add-apt-repository ppa:deadsnakes/ppa -y
-            apt-get update
-            apt-get install -y python3.10 python3.10-dev python3.10-distutils
+            # 2. 升级基础构建工具
+            python3 -m pip install --upgrade pip setuptools wheel
             
-            # 3. 安装并升级 pip
-            curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
-            python3.10 -m pip install --upgrade pip setuptools wheel
+            # 3. 安装你的核心算法和接口依赖
+            pip3 install -r requirements_linux.txt
             
-            # 4. 使用 python3.10 安装依赖
-            # 明确指定版本号可以避免由于最新版库不兼容 20.04 导致的问题
-            python3.10 -m pip install -r requirements_linux.txt
-            python3.10 -m pip install pyinstaller
+            # 4. 安装打包工具
+            pip3 install pyinstaller
             
             # 5. 执行正式打包
-            # 重点：通过 python3.10 -m PyInstaller 调用
-            python3.10 -m PyInstaller --onefile --clean \
+            pyinstaller --onefile --clean \
                         --collect-all ortools \
                         --hidden-import=uvicorn.logging \
                         --name railway_app_arm64 main.py
