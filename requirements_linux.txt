@@ -1,11 +1,9 @@
-# 基础框架
 fastapi
 uvicorn
 pydantic
 pydantic-core
-
-# 核心算法 (必须包含，且不写死版本以适配 ARM)
-ortools
-
-# 辅助库 (代码中用到的类型支持)
 typing-extensions
+
+# --- 核心降级区：完美兼容飞腾等老旧 ARM 芯片 ---
+numpy==1.23.5
+ortools==9.6.2534
