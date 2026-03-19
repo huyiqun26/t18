@@ -1,4 +1,4 @@
-name: Build Linux ARM64 Final (Conda + Ubuntu 18.04 Fix)
+name: Build Linux ARM64 Final (Docker Native)
 
 on:
   push:
@@ -11,42 +11,33 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
+      # 启动 ARM 模拟器
+      - name: Set up QEMU for ARM64
         uses: docker/setup-qemu-action@v3
 
-      - name: Build on ARM64 Container
-        uses: uraimo/run-on-arch-action@v2
-        with:
-          arch: aarch64
-          # 依然坚守 18.04，确保底层 GLIBC 是 2.27
-          distro: ubuntu18.04 
-          githubToken: ${{ github.token }}
-          
-          run: |
-            # 1. 安装 Ubuntu 18.04 基础工具
-            apt-get update
-            apt-get install -y wget bzip2 binutils libatomic1 g++ gcc make zlib1g-dev
+      # 直接使用 Python 官方的纯净 ARM64 镜像 (基于 Debian 10，完美契合 GLIBC 2.28)
+      - name: Build using official ARM64 Python container
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/ws -w /ws arm64v8/python:3.10-buster /bin/bash -c "
+            # 1. 安装基础编译环境
+            apt-get update && apt-get install -y binutils gcc g++ make zlib1g-dev
             
-            # 2. 【核心修复】下载 2023 年的旧版 Miniconda (自带 Python 3.10，完美兼容 GLIBC 2.27)
-            echo "开始安装旧版 Miniconda..."
-            wget https://repo.anaconda.com/miniconda/Miniconda3-py310_23.1.0-1-Linux-aarch64.sh -O miniconda.sh
-            bash miniconda.sh -b -p /opt/conda
-            
-            # 3. 配置环境变量 (此时系统已经拥有了纯净的 Python 3.10)
-            export PATH="/opt/conda/bin:$PATH"
-            
-            # 4. 安装依赖
-            echo "开始安装 Python 依赖..."
+            # 2. 安装你的依赖 (使用降级后的 txt)
             pip install --upgrade pip
             pip install -r requirements_linux.txt
-            pip install pyinstaller
             
-            # 5. 执行正式打包
-            echo "开始使用 PyInstaller 打包..."
+            # 3. 【核心杀招】强制从源码编译安装 PyInstaller，杜绝任何非法高级指令
+            pip install pyinstaller --no-binary pyinstaller
+            
+            # 4. 执行正式打包
             pyinstaller --onefile --clean \
                         --collect-all ortools \
                         --hidden-import=uvicorn.logging \
                         --name railway_app_arm64 main.py
+            
+            # 5. 赋予产物最高权限，防止外部读取失败
+            chmod -R 777 dist/
+          "
 
       - name: Upload Finished Binary
         uses: actions/upload-artifact@v4
