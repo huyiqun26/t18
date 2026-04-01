@@ -14,10 +14,12 @@ jobs:
       - name: Set up QEMU for ARM64
         uses: docker/setup-qemu-action@v3
 
-      - name: Build using official ARM64 Python container
+      - name: Build and smoke test in official ARM64 Python container
         run: |
           docker run --rm -v ${{ github.workspace }}:/ws -w /ws arm64v8/python:3.10-buster /bin/bash -c "
-            apt-get update && apt-get install -y binutils gcc g++ make zlib1g-dev
+            set -e
+
+            apt-get update && apt-get install -y binutils gcc g++ make zlib1g-dev curl
 
             pip install --upgrade pip
             pip install -r requirements_linux.txt
@@ -36,6 +38,16 @@ jobs:
                         --name railway_app_arm64 main.py
 
             chmod -R 777 dist/
+
+            ./dist/railway_app_arm64 &
+            APP_PID=\$!
+
+            sleep 8
+
+            curl --fail http://127.0.0.1:2376/health
+
+            kill \$APP_PID || true
+            wait \$APP_PID || true
           "
 
       - name: Upload Finished Binary
