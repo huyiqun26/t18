@@ -1,63 +1,45 @@
-name: Build Linux ARM64 Final
+name: Build Linux ARM64 Final (Docker Native)
 
 on:
-  workflow_dispatch:
   push:
     branches: [ main ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Set up QEMU for ARM64
         uses: docker/setup-qemu-action@v3
 
-      - name: Build ARM64 binary in Debian Buster container
+      - name: Build using official ARM64 Python container
         run: |
-          docker run --rm \
-            --platform linux/arm64 \
-            -v "${{ github.workspace }}:/ws" \
-            -w /ws \
-            arm64v8/python:3.10-buster \
-            /bin/bash -lc '
-              set -euo pipefail
+          docker run --rm -v ${{ github.workspace }}:/ws -w /ws arm64v8/python:3.10-buster /bin/bash -c "
+            apt-get update && apt-get install -y binutils gcc g++ make zlib1g-dev
 
-              apt-get update
-              apt-get install -y --no-install-recommends \
-                binutils gcc g++ make zlib1g-dev
+            pip install --upgrade pip
+            pip install -r requirements_linux.txt
 
-              python -m pip install --upgrade pip
-              python -m pip install -r requirements_linux.txt
+            pip install pyinstaller --no-binary pyinstaller
 
-              # 从源码编译 PyInstaller，尽量避免 bootloader 指令集兼容问题
-              python -m pip install "pyinstaller==6.16.0" --no-binary pyinstaller
+            pyinstaller --onefile --clean \
+                        --collect-all ortools \
+                        --collect-all uvicorn \
+                        --collect-all fastapi \
+                        --collect-all pydantic \
+                        --hidden-import=uvicorn.logging \
+                        --hidden-import=uvicorn.loops.auto \
+                        --hidden-import=uvicorn.protocols.http.auto \
+                        --hidden-import=uvicorn.lifespan.on \
+                        --name railway_app_arm64 main.py
 
-              pyinstaller \
-                --onefile \
-                --clean \
-                --collect-all ortools \
-                --collect-all fastapi \
-                --collect-all starlette \
-                --collect-all pydantic \
-                --collect-all uvicorn \
-                --hidden-import uvicorn.logging \
-                --hidden-import uvicorn.loops.auto \
-                --hidden-import uvicorn.protocols.http.auto \
-                --hidden-import uvicorn.lifespan.on \
-                --name railway_app_arm64 \
-                main.py
+            chmod -R 777 dist/
+          "
 
-              chmod 755 dist/railway_app_arm64
-            '
-
-      - name: Upload finished binary
+      - name: Upload Finished Binary
         uses: actions/upload-artifact@v4
         with:
           name: railway-arm64-binary
           path: dist/railway_app_arm64
-          if-no-files-found: error
