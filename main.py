@@ -486,7 +486,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             solver.Add(y[j] >= y[j + 1])
 
         solver.Minimize(sum(y[j] for j in sc_ids))
-        solver.set_time_limit(30000)
+        solver.set_time_limit(300000)
         logger.info("算法开始求解，箱体数=%s，预计车次数=%s", len(all_sub_containers), est_bins)
         status = solver.Solve()
 
