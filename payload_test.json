@@ -1,0 +1,182 @@
+{
+  "code": 0,
+  "msg": "success",
+  "systemSettings": {
+    "_comment": "全局配置参数",
+    "SC_Constraint": {
+      "maxWeightLimit": 60000,
+      "maxLengthLimit": 800.0,
+      "_desc": "特制集装箱限制: 载重60吨, 换长800"
+    },
+    "Person_Weight": {
+      "weight_per_person": 75.0,
+      "_desc": "单人平均重量(kg)"
+    },
+    "Box_Specs": {
+      "_desc": "小箱规格: length_unit=换长, weight=自重, capacity=载客/体积",
+      "Person_Box_C1": { "capacity": 20, "length_unit": 2.27, "weight": 5000 },
+      "Person_Box_C2": { "capacity": 40, "length_unit": 2.27, "weight": 5000 },
+      "Person_Box_C3": { "capacity": 70, "length_unit": 2.27, "weight": 5000 },
+      "Equip_Box_Large": { "length_unit": 1.4, "weight": 2000, "_note": "装大型器械" },
+      "Equip_Box_Small": { "length_unit": 1.6, "weight": 2000, "capacity_volume": 120.0, "_note": "装货物(m3)" }
+    }
+  },
+  "data": [
+    {
+      "organizationID": "Com_01",
+      "organizationName": "第一工程局-总部",
+      "Unitclass": "2",
+      "belongTo": "Group_A",
+      "personCount": 180,
+      "componentList": [
+        { "componentname": "重型吊车A臂", "componentID": "C01_1", "componentweight": 2500, "needcarLarge": 0.8, "zzbdid": "", "bddxid": "", "dxcode": "" },
+        { "componentname": "重型吊车B臂", "componentID": "C01_2", "componentweight": 2500, "needcarLarge": 0.8, "zzbdid": "", "bddxid": "", "dxcode": "" },
+        { "componentname": "发电机组Type-X", "componentID": "C01_3", "componentweight": 3000, "needcarLarge": 0.9, "zzbdid": "", "bddxid": "", "dxcode": "" },
+        { "componentname": "备用油箱", "componentID": "C01_4", "componentweight": 500, "needcarLarge": 0.2, "zzbdid": "", "bddxid": "", "dxcode": "" }
+      ],
+      "goodsList": [
+        { "name": "精密测量仪", "ID": "G01_1", "weight": 20, "tj": 0.5, "count": 50, "category": "精密仪器" },
+        { "name": "图纸资料箱", "ID": "G01_2", "weight": 30, "tj": 0.8, "count": 20, "category": "精密仪器" }
+      ]
+    },
+    {
+      "organizationID": "Com_02",
+      "organizationName": "第二建设公司",
+      "Unitclass": "2",
+      "belongTo": "Group_A",
+      "personCount": 120,
+      "componentList": [
+        { "componentname": "挖掘机履带", "componentID": "C02_1", "componentweight": 1500, "needcarLarge": 0.6, "zzbdid": "", "bddxid": "", "dxcode": "" },
+        { "componentname": "挖掘机挖斗", "componentID": "C02_2", "componentweight": 800, "needcarLarge": 0.35, "zzbdid": "", "bddxid": "", "dxcode": "" }
+      ],
+      "goodsList": [
+        { "name": "维修工具包", "ID": "G02_1", "weight": 40, "tj": 1.0, "count": 100, "category": "工具" }
+      ]
+    },
+    {
+      "organizationID": "Com_03",
+      "organizationName": "第三路桥队",
+      "Unitclass": "2",
+      "belongTo": "Group_B",
+      "personCount": 90,
+      "componentList": [],
+      "goodsList": [
+        { "name": "水泥添加剂", "ID": "G03_1", "weight": 50, "tj": 0.2, "count": 400, "category": "建材" },
+        { "name": "路障指示牌", "ID": "G03_2", "weight": 10, "tj": 0.5, "count": 100, "category": "安全标识" }
+      ]
+    },
+    {
+      "organizationID": "Com_04",
+      "organizationName": "第四勘探队",
+      "Unitclass": "2",
+      "belongTo": "Group_B",
+      "personCount": 85,
+      "componentList": [
+        { "componentname": "钻机主机", "componentID": "C04_1", "componentweight": 4000, "needcarLarge": 1.0, "zzbdid": "", "bddxid": "", "dxcode": "" },
+        { "componentname": "钻杆组", "componentID": "C04_2", "componentweight": 2000, "needcarLarge": 0.5, "zzbdid": "", "bddxid": "", "dxcode": "" }
+      ],
+      "goodsList": []
+    },
+    {
+      "organizationID": "Com_05",
+      "organizationName": "第五安装队",
+      "Unitclass": "2",
+      "belongTo": "Group_A",
+      "personCount": 60,
+      "componentList": [
+        { "componentname": "变压器", "componentID": "C05_1", "componentweight": 1200, "needcarLarge": 0.4, "zzbdid": "", "bddxid": "", "dxcode": "" },
+        { "componentname": "配电柜", "componentID": "C05_2", "componentweight": 800, "needcarLarge": 0.4, "zzbdid": "", "bddxid": "", "dxcode": "" }
+      ],
+      "goodsList": [
+        { "name": "电缆", "ID": "G05_1", "weight": 100, "tj": 1.5, "count": 60, "category": "电气" }
+      ]
+    },
+    {
+      "organizationID": "Com_06",
+      "organizationName": "第六后勤部",
+      "Unitclass": "2",
+      "belongTo": "Group_C",
+      "personCount": 40,
+      "componentList": [],
+      "goodsList": [
+        { "name": "帐篷", "ID": "G06_1", "weight": 30, "tj": 2.0, "count": 50, "category": "宿营" },
+        { "name": "饮用水", "ID": "G06_2", "weight": 20, "tj": 0.05, "count": 1000, "category": "食品" },
+        { "name": "速食食品", "ID": "G06_3", "weight": 10, "tj": 0.1, "count": 500, "category": "食品" }
+      ]
+    },
+    {
+      "organizationID": "Com_07",
+      "organizationName": "第七爆破组",
+      "Unitclass": "2",
+      "belongTo": "Group_B",
+      "personCount": 55,
+      "componentList": [
+        { "componentname": "防护盾板", "componentID": "C07_1", "componentweight": 1000, "needcarLarge": 0.3, "zzbdid": "", "bddxid": "", "dxcode": "" }
+      ],
+      "goodsList": [
+        { "name": "安全索", "ID": "G07_1", "weight": 5, "tj": 0.1, "count": 200, "category": "安全防护" }
+      ]
+    },
+    {
+      "organizationID": "Com_08",
+      "organizationName": "第八通讯连",
+      "Unitclass": "2",
+      "belongTo": "Group_C",
+      "personCount": 70,
+      "componentList": [
+        { "componentname": "雷达基座", "componentID": "C08_1", "componentweight": 2500, "needcarLarge": 0.7, "zzbdid": "", "bddxid": "", "dxcode": "" }
+      ],
+      "goodsList": [
+        { "name": "服务器机架", "ID": "G08_1", "weight": 80, "tj": 1.2, "count": 20, "category": "通讯设备" }
+      ]
+    },
+    {
+      "organizationID": "Com_09",
+      "organizationName": "第九医疗队",
+      "Unitclass": "2",
+      "belongTo": "Group_C",
+      "personCount": 30,
+      "componentList": [],
+      "goodsList": [
+        { "name": "急救箱", "ID": "G09_1", "weight": 10, "tj": 0.2, "count": 150, "category": "医疗" },
+        { "name": "氧气瓶", "ID": "G09_2", "weight": 40, "tj": 0.4, "count": 50, "category": "医疗" }
+      ]
+    },
+    {
+      "organizationID": "Com_10",
+      "organizationName": "第十抢修队",
+      "Unitclass": "2",
+      "belongTo": "Group_A",
+      "personCount": 65,
+      "componentList": [
+        { "componentname": "移动工作台", "componentID": "C10_1", "componentweight": 600, "needcarLarge": 0.25, "zzbdid": "", "bddxid": "", "dxcode": "" },
+        { "componentname": "焊接机器人", "componentID": "C10_2", "componentweight": 800, "needcarLarge": 0.3, "zzbdid": "", "bddxid": "", "dxcode": "" }
+      ],
+      "goodsList": [
+        { "name": "零件盒", "ID": "G10_1", "weight": 15, "tj": 0.3, "count": 80, "category": "零件" }
+      ]
+    },
+    {
+      "organizationID": "Com_11",
+      "organizationName": "第十一绿化组",
+      "Unitclass": "2",
+      "belongTo": "Group_B",
+      "personCount": 25,
+      "componentList": [],
+      "goodsList": [
+        { "name": "树苗", "ID": "G11_1", "weight": 5, "tj": 0.1, "count": 1000, "category": "绿化" }
+      ]
+    },
+    {
+      "organizationID": "Com_12",
+      "organizationName": "第十二检测组",
+      "Unitclass": "2",
+      "belongTo": "Group_A",
+      "personCount": 45,
+      "componentList": [
+        { "componentname": "检测车", "componentID": "C12_1", "componentweight": 3500, "needcarLarge": 0.95, "zzbdid": "", "bddxid": "", "dxcode": "" }
+      ],
+      "goodsList": []
+    }
+  ]
+}
