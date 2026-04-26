@@ -22,6 +22,7 @@ jobs:
             pip install --upgrade pip
             pip install -r requirements_linux.txt
             pip install pyinstaller --no-binary pyinstaller
+
             pyinstaller --onefile --clean \
                         --collect-all ortools \
                         --collect-all uvicorn \
@@ -32,12 +33,26 @@ jobs:
                         --hidden-import=uvicorn.protocols.http.auto \
                         --hidden-import=uvicorn.lifespan.on \
                         --name railway_app_arm64 main.py
+
             chmod -R 777 dist/
+
+            test -f payload_test.json
+
             ./dist/railway_app_arm64 &
             APP_PID=\$!
+
             sleep 12
+
             curl --fail http://127.0.0.1:2376/health
-            curl --fail http://127.0.0.1:2376/api/v1/optimize -X POST -H \"Content-Type: application/json\" -d '{\"code\":0,\"msg\":\"success\",\"systemSettings\":{\"_comment\":\"全局配置参数\",\"SC_Constraint\":{\"maxWeightLimit\":60000,\"maxLengthLimit\":800.0,\"_desc\":\"特制集装箱限制: 载重60吨, 换长800\"},\"Person_Weight\":{\"weight_per_person\":75.0,\"_desc\":\"单人平均重量(kg)\"},\"Box_Specs\":{\"_desc\":\"小箱规格: length_unit=换长, weight=自重, capacity=载客/体积\",\"Person_Box_C1\":{\"capacity\":20,\"length_unit\":2.27,\"weight\":5000},\"Person_Box_C2\":{\"capacity\":40,\"length_unit\":2.27,\"weight\":5000},\"Person_Box_C3\":{\"capacity\":70,\"length_unit\":2.27,\"weight\":5000},\"Equip_Box_Large\":{\"length_unit\":1.4,\"weight\":2000,\"_note\":\"装大型器械\"},\"Equip_Box_Small\":{\"length_unit\":1.6,\"weight\":2000,\"capacity_volume\":120.0,\"_note\":\"装货物(m3)\"}}},\"data\":[{\"organizationID\":\"Com_01\",\"organizationName\":\"第一工程局-总部\",\"Unitclass\":\"2\",\"belongTo\":\"Group_A\",\"personCount\":180,\"componentList\":[{\"componentname\":\"重型吊车A臂\",\"componentID\":\"C01_1\",\"componentweight\":2500,\"needcarLarge\":0.8},{\"componentname\":\"重型吊车B臂\",\"componentID\":\"C01_2\",\"componentweight\":2500,\"needcarLarge\":0.8},{\"componentname\":\"发电机组Type-X\",\"componentID\":\"C01_3\",\"componentweight\":3000,\"needcarLarge\":0.9},{\"componentname\":\"备用油箱\",\"componentID\":\"C01_4\",\"componentweight\":500,\"needcarLarge\":0.2}],\"goodsList\":[{\"name\":\"精密测量仪\",\"ID\":\"G01_1\",\"weight\":20,\"tj\":0.5,\"count\":50},{\"name\":\"图纸资料箱\",\"ID\":\"G01_2\",\"weight\":30,\"tj\":0.8,\"count\":20}]}]}'
+
+            curl --fail \
+                 -X POST http://127.0.0.1:2376/api/v1/optimize \
+                 -H \"Content-Type: application/json\" \
+                 --data-binary @payload_test.json \
+                 -o smoke_response.json
+
+            cat smoke_response.json
+
             kill \$APP_PID || true
             wait \$APP_PID || true
           "
@@ -47,3 +62,9 @@ jobs:
         with:
           name: railway-arm64-binary
           path: dist/railway_app_arm64
+
+      - name: Upload Smoke Response
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-response
+          path: smoke_response.json
