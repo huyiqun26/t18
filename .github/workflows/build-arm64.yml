@@ -24,7 +24,6 @@ jobs:
             pip install pyinstaller --no-binary pyinstaller
 
             pyinstaller --onefile --clean \
-                        --collect-all ortools \
                         --collect-all uvicorn \
                         --collect-all fastapi \
                         --collect-all pydantic \
@@ -41,7 +40,7 @@ jobs:
             ./dist/railway_app_arm64 &
             APP_PID=\$!
 
-            sleep 12
+            sleep 8
 
             curl --fail http://127.0.0.1:2376/health
 
