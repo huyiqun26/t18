@@ -1,3 +1,4 @@
+
 import asyncio
 import atexit
 import logging
@@ -153,18 +154,18 @@ def model_to_payload(model: Any) -> Dict[str, Any]:
     raise TypeError(f"不支持的请求模型类型: {type(model)}")
 
 
-# ========================== 算法核心（已替换为 qifa_yingji_chaoxian_rule 结构） ==========================
+# ========================== 算法核心（已替换为 qifa_yingji_chaoxian_string_rule 结构） ==========================
 class SubContainer:
     def __init__(self, box_type, length_unit, weight_empty, max_capacity, capacity_type='count', category=None):
         self.box_type = box_type
         self.length_unit = float(length_unit)
-        self.weight = float(weight_empty)
+        self.weight = float(weight_empty)  # 箱体自重 + 已装人员/物资重量，后续直接用于单车牵引总重
         self.max_capacity = max_capacity
         self.capacity_type = capacity_type
         self.current_load = 0.0
-        self.contents: List[Dict[str, Any]] = []
+        self.contents = []          # 物品实体字典列表
         self.owners = set()
-        self.equip_category = category
+        self.equip_category = category  # 小物资箱的类别
 
     def add_item(self, company_id, item_info, item_weight, item_load_value):
         if self.current_load + item_load_value <= self.max_capacity + 1e-6:
@@ -188,6 +189,9 @@ ALGO_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_ALGO_WORKERS, thread_name_pre
 ALGO_GATE = threading.BoundedSemaphore(MAX_ALGO_WORKERS)
 
 
+# ==========================================
+# 工具函数
+# ==========================================
 def safe_int(value, default=0):
     try:
         if value is None or value == '':
@@ -197,40 +201,44 @@ def safe_int(value, default=0):
         return default
 
 
-def get_company_yingji_name(comp):
-    def normalize_yingji(value):
-        if value is None:
-            return ''
-        s = str(value).strip()
-        mapping = {
-            '1': '1', '2': '2', '3': '3',
-            '一年级': '1', '二年级': '2', '三年级': '3',
-            '一': '1', '二': '2', '三': '3',
-            '第1年级': '1', '第2年级': '2', '第3年级': '3',
-            '第一级': '1', '第二级': '2', '第三级': '3',
-        }
-        if s in mapping:
-            return mapping[s]
-        digits = ''.join(ch for ch in s if ch.isdigit())
-        if digits in ('1', '2', '3'):
-            return digits
+def normalize_yingji_name(value):
+    """
+    yingjiName 按任意非空字符串识别，不再限定为 "1"/"2"/"3"。
+    例如："合成1年级"、"合成二年级"、"应急保障A组" 都会作为不同类别参与约束。
+    空字符串表示未提供，不参与 yingjiName 种类数限制。
+    """
+    if value is None:
         return ''
+    return str(value).strip()
 
+
+def is_effective_yingji_name(value):
+    """是否作为有效 yingjiName 参与“每车最多两种”约束。"""
+    return normalize_yingji_name(value) != ''
+
+
+def get_company_yingji_name(comp):
+    """
+    新增入参字段使用：yingjiName，字符串形式，取值不做固定枚举限制。
+    只要不同公司 yingjiName 字符串不同，就视为不同类别。
+    如果旧数据未提供 yingjiName，则回退到 Unitclass 字符串；否则为空字符串，不参与限制。
+    """
     if 'yingjiName' in comp:
-        y = normalize_yingji(comp.get('yingjiName'))
-        if y in ('1', '2', '3'):
-            return y
-        raise AlgorithmError(
-            f"公司 {comp.get('organizationID', '')} 的 yingjiName={comp.get('yingjiName')} 非法，必须为字符串 '1'/'2'/'3'"
-        )
+        return normalize_yingji_name(comp.get('yingjiName'))
 
+    # 兼容旧入参：没有 yingjiName 时不直接中断，便于老数据继续试跑。
     u_class = safe_int(comp.get('Unitclass'), 0)
-    if u_class in (1, 2, 3):
+    if u_class > 0:
         return str(u_class)
     return ''
 
 
+
 def normalize_is_chaoxian(value):
+    """
+    新增入参字段：is_chaoXian，字符串取值建议为 "是" / "否" / ""。
+    输出时也保持字符串形式，便于前端或甲方系统直接读取。
+    """
     if value is None:
         return ''
     s = str(value).strip()
@@ -242,10 +250,12 @@ def normalize_is_chaoxian(value):
         return '是'
     if s in no_values:
         return '否'
+    # 非法值不直接中断，按空字符串处理，避免现场历史数据无法运行。
     return ''
 
 
 def box_has_chaoxian_equipment(box):
+    """判断一个 Equip_Box_Large 小箱中是否含 is_chaoXian="是" 的大型装备。"""
     if getattr(box, 'box_type', '') != 'Equip_Box_Large':
         return False
     for item in getattr(box, 'contents', []):
@@ -264,20 +274,22 @@ def box_chaoxian_owners(box):
     owners.discard('')
     return owners
 
-
 def dominant_ratio(weight, length, max_weight, max_length):
     return max(weight / max_weight if max_weight else 0.0,
                length / max_length if max_length else 0.0)
 
 
+# ==========================================
+# 车辆状态：用于装车启发式
+# ==========================================
 class VehicleState:
     def __init__(self):
         self.weight = 0.0
         self.length = 0.0
-        self.units = []
+        self.units = []             # unit 字典列表
         self.companies = set()
-        self.yingji_companies = defaultdict(set)
-        self.chaoXian_companies = set()
+        self.yingji_companies = defaultdict(set)  # yingjiName -> companies set
+        self.chaoXian_companies = set()           # 本车内含 is_chaoXian="是" 大型装备的公司
 
     def clone(self):
         other = VehicleState()
@@ -294,13 +306,16 @@ class VehicleState:
             return False
         if self.length + unit['length'] > max_length + 1e-6:
             return False
+
+        # 硬约束：同一辆车上，最多只能出现 2 种不同的非空 yingjiName 字符串。
+        # 注意：这里限制的是 yingjiName 的“字符串类别数”，不是每个 yingjiName 下的公司数量。
         current_yingji_names = {
             y for y, cids in self.yingji_companies.items()
-            if y in ('1', '2', '3') and len(cids) > 0
+            if is_effective_yingji_name(y) and len(cids) > 0
         }
         unit_yingji_names = {
             company_yingji_name.get(cid, '') for cid in unit['owners']
-            if company_yingji_name.get(cid, '') in ('1', '2', '3')
+            if is_effective_yingji_name(company_yingji_name.get(cid, ''))
         }
         if len(current_yingji_names | unit_yingji_names) > 2:
             return False
@@ -313,7 +328,7 @@ class VehicleState:
         for cid in unit['owners']:
             self.companies.add(cid)
             yingji_name = company_yingji_name.get(cid, '')
-            if yingji_name in ('1', '2', '3'):
+            if is_effective_yingji_name(yingji_name):
                 self.yingji_companies[yingji_name].add(cid)
         if unit.get('has_chaoXian_equipment'):
             self.chaoXian_companies.update(unit.get('chaoXian_owners', set()))
@@ -322,6 +337,8 @@ class VehicleState:
         self.weight -= unit['weight']
         self.length -= unit['length']
         self.units.remove(unit)
+
+        # 简单可靠地重建公司与年级集合，避免删除同公司多个 unit 时出错。
         self.companies = set()
         self.yingji_companies = defaultdict(set)
         self.chaoXian_companies = set()
@@ -329,610 +346,678 @@ class VehicleState:
             for cid in u['owners']:
                 self.companies.add(cid)
                 yingji_name = company_yingji_name.get(cid, '')
-                if yingji_name in ('1', '2', '3'):
+                if is_effective_yingji_name(yingji_name):
                     self.yingji_companies[yingji_name].add(cid)
             if u.get('has_chaoXian_equipment'):
                 self.chaoXian_companies.update(u.get('chaoXian_owners', set()))
 
 
+# ==========================================
+# 主逻辑
+# ==========================================
+
 def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        sys_settings = raw_data.get('systemSettings', {})
-        sc_limit = sys_settings.get('SC_Constraint', {'maxWeightLimit': 60000, 'maxLengthLimit': 800.0})
-        person_weight = sys_settings.get('Person_Weight', {'weight_per_person': 75.0})['weight_per_person']
-        box_specs = sys_settings.get('Box_Specs', {})
+            sys_settings = raw_data.get('systemSettings', {})
+            sc_limit = sys_settings.get('SC_Constraint', {'maxWeightLimit': 60000, 'maxLengthLimit': 800.0})
+            person_weight = sys_settings.get('Person_Weight', {'weight_per_person': 75.0})['weight_per_person']
+            box_specs = sys_settings.get('Box_Specs', {})
 
-        max_weight_per_sc = float(sc_limit['maxWeightLimit'])
-        max_length_per_sc = float(sc_limit['maxLengthLimit'])
+            # maxWeightLimit 按“单辆车牵引总重”理解：箱体自重 + 人员重量 + 物资重量，全都计入。
+            max_weight_per_sc = float(sc_limit['maxWeightLimit'])
+            max_length_per_sc = float(sc_limit['maxLengthLimit'])
 
-        all_sub_containers = []
-        open_person_boxes = defaultdict(list)
-        open_large_boxes = defaultdict(list)
-        open_small_boxes = defaultdict(list)
+            all_sub_containers = []
 
-        companies = raw_data.get('data', [])
-        company_yingji_name = {}
-        company_name = {}
-        for comp in companies:
-            cid = comp['organizationID']
-            company_yingji_name[cid] = get_company_yingji_name(comp)
-            company_name[cid] = comp.get('organizationName', '')
+            # 关键修改 1：开口箱不再跨公司复用。
+            # 这样可以从源头减少“同公司人货分离”和“不同公司混箱”问题，后续装车更容易把同一公司整体放在一辆车上。
+            open_person_boxes = defaultdict(list)          # owner_id -> [SubContainer]
+            open_large_boxes = defaultdict(list)           # owner_id -> [SubContainer]
+            open_small_boxes = defaultdict(list)           # (owner_id, category) -> [SubContainer]
 
-        missing_yingji_name = [cid for cid, y in company_yingji_name.items() if y not in ('1', '2', '3')]
-        if missing_yingji_name:
-            print('提示：以下公司未提供有效 yingjiName="1"/"2"/"3"，装车时不参与yingjiName种类数限制：')
-            print(', '.join(missing_yingji_name[:20]) + ('...' if len(missing_yingji_name) > 20 else ''))
+            companies = raw_data.get('data', [])
+            company_yingji_name = {}
+            company_name = {}
+            for comp in companies:
+                cid = comp['organizationID']
+                company_yingji_name[cid] = get_company_yingji_name(comp)
+                company_name[cid] = comp.get('organizationName', '')
 
-        def add_people_to_boxes(b_type, num_people, owner_id):
-            spec = box_specs.get(b_type)
-            if not spec or num_people <= 0:
-                return 0
-            cap = spec['capacity']
-            remaining = int(num_people)
-            added_total = 0
+            missing_yingji_name = [cid for cid, y in company_yingji_name.items() if not is_effective_yingji_name(y)]
+            if missing_yingji_name:
+                print('提示：以下公司未提供非空 yingjiName，装车时不参与 yingjiName 种类数限制：')
+                print(', '.join(missing_yingji_name[:20]) + ('...' if len(missing_yingji_name) > 20 else ''))
 
-            def create_person_info(count):
-                return {
-                    "type": "person",
-                    "company_id": owner_id,
-                    "box_type": b_type,
-                    "count": int(count)
-                }
+            # ==========================================
+            # 人员拼装：只允许同公司人员复用同公司已打开人员箱
+            # ==========================================
+            def add_people_to_boxes(b_type, num_people, owner_id):
+                spec = box_specs.get(b_type)
+                if not spec or num_people <= 0:
+                    return 0
+                cap = spec['capacity']
+                remaining = int(num_people)
+                added_total = 0
 
-            for box in open_person_boxes[owner_id]:
-                if box.box_type == b_type and box.current_load < box.max_capacity:
-                    space = box.max_capacity - box.current_load
-                    to_add = min(remaining, int(space))
-                    if to_add > 0:
-                        box.add_item(owner_id, create_person_info(to_add), to_add * person_weight, to_add)
-                        remaining -= to_add
-                        added_total += to_add
-                    if remaining <= 0:
-                        break
-
-            while remaining > 0:
-                to_add = min(remaining, cap)
-                new_box = SubContainer(b_type, spec['length_unit'], spec['weight'], cap, 'count')
-                new_box.add_item(owner_id, create_person_info(to_add), to_add * person_weight, to_add)
-                all_sub_containers.append(new_box)
-                open_person_boxes[owner_id].append(new_box)
-                remaining -= to_add
-                added_total += to_add
-
-            return added_total
-
-        for comp in companies:
-            cid = comp['organizationID']
-            u_class = safe_int(comp.get('Unitclass'), 5)
-            p_count = safe_int(comp.get('personCount'), 0)
-            remaining_p = p_count
-
-            if u_class == 2:
-                c2_cap = box_specs.get('Person_Box_C2', {}).get('capacity', 40)
-                c2_quota = 2 * c2_cap
-                if remaining_p > 0:
-                    to_c2 = min(remaining_p, c2_quota)
-                    add_people_to_boxes('Person_Box_C2', to_c2, cid)
-                    remaining_p -= to_c2
-                if remaining_p > 0:
-                    add_people_to_boxes('Person_Box_C3', remaining_p, cid)
-            else:
-                if u_class == 1:
-                    mandatory = {'Person_Box_C1': 1, 'Person_Box_C2': 3, 'Person_Box_C3': 1}
-                elif u_class == 3:
-                    mandatory = {'Person_Box_C2': 2, 'Person_Box_C3': 1}
-                elif u_class == 4:
-                    mandatory = {'Person_Box_C2': 1, 'Person_Box_C3': 1}
-                else:
-                    mandatory = {'Person_Box_C3': 1}
-
-                for b_type, count in mandatory.items():
-                    for _ in range(count):
-                        if remaining_p > 0:
-                            cap = box_specs.get(b_type, {}).get('capacity', 0)
-                            to_add = min(remaining_p, cap)
-                            add_people_to_boxes(b_type, to_add, cid)
-                            remaining_p -= to_add
-                        else:
-                            add_people_to_boxes(b_type, 0, cid)
-
-                if remaining_p > 0:
-                    add_people_to_boxes('Person_Box_C3', remaining_p, cid)
-
-            comps_list = comp.get('componentList', [])
-            comps_list.sort(key=lambda x: x.get('needcarLarge', 0), reverse=True)
-            spec_large = box_specs.get('Equip_Box_Large')
-            if spec_large is None:
-                raise AlgorithmError('缺少 Equip_Box_Large 配置')
-
-            for item in comps_list:
-                name = item['componentname']
-                w = float(item['componentweight'])
-                occupancy = float(item.get('needcarLarge', 1.0))
-
-                item_info = {
-                    "type": "component",
-                    "company_id": cid,
-                    "componentname": name,
-                    "componentID": item.get('componentID', ''),
-                    "zzbdid": item.get('zzbdid', ''),
-                    "bddxid": item.get('bddxid', ''),
-                    "dxcode": item.get('dxcode', ''),
-                    "is_chaoXian": normalize_is_chaoxian(item.get('is_chaoXian', '')),
-                    "occupancy": occupancy
-                }
-
-                best_box = None
-                min_rem = 1.0
-                for box in open_large_boxes[cid]:
-                    if box.current_load + occupancy <= 1.001:
-                        rem = 1.0 - (box.current_load + occupancy)
-                        if rem < min_rem:
-                            min_rem = rem
-                            best_box = box
-
-                if best_box:
-                    best_box.add_item(cid, item_info, w, occupancy)
-                else:
-                    new_box = SubContainer('Equip_Box_Large', spec_large['length_unit'], spec_large['weight'], 1.0, 'occupancy')
-                    new_box.add_item(cid, item_info, w, occupancy)
-                    all_sub_containers.append(new_box)
-                    open_large_boxes[cid].append(new_box)
-
-            goods_list = comp.get('goodsList', [])
-            flat_goods = []
-            for g in goods_list:
-                count = safe_int(g.get('count', 1), 1)
-                for _ in range(count):
-                    flat_goods.append(g.copy())
-
-            flat_goods.sort(key=lambda x: x.get('tj', 0), reverse=True)
-            spec_small = box_specs.get('Equip_Box_Small')
-
-            if spec_small:
-                max_vol = float(spec_small.get('capacity_volume', 120.0))
-                for item in flat_goods:
-                    name = item['name']
-                    w = float(item['weight'])
-                    vol = float(item.get('tj', 0))
-                    cat = item.get('category', '未分类')
-
-                    item_info = {
-                        "type": "goods",
-                        "company_id": cid,
-                        "name": name,
-                        "ID": item.get('ID', ''),
-                        "category": cat,
-                        "count": 1
+                def create_person_info(count):
+                    return {
+                        "type": "person",
+                        "company_id": owner_id,
+                        "box_type": b_type,
+                        "count": int(count)
                     }
 
-                    key = (cid, cat)
-                    placed = False
-                    for box in open_small_boxes[key]:
-                        if box.current_load + vol <= max_vol + 1e-6:
-                            box.add_item(cid, item_info, w, vol)
-                            placed = True
+                for box in open_person_boxes[owner_id]:
+                    if box.box_type == b_type and box.current_load < box.max_capacity:
+                        space = box.max_capacity - box.current_load
+                        to_add = min(remaining, int(space))
+                        if to_add > 0:
+                            box.add_item(owner_id, create_person_info(to_add), to_add * person_weight, to_add)
+                            remaining -= to_add
+                            added_total += to_add
+                        if remaining <= 0:
                             break
 
-                    if not placed:
-                        new_box = SubContainer(
-                            'Equip_Box_Small',
-                            spec_small['length_unit'],
-                            spec_small['weight'],
-                            max_vol,
-                            'volume',
-                            category=cat
-                        )
-                        new_box.add_item(cid, item_info, w, vol)
-                        all_sub_containers.append(new_box)
-                        open_small_boxes[key].append(new_box)
+                while remaining > 0:
+                    to_add = min(remaining, cap)
+                    new_box = SubContainer(b_type, spec['length_unit'], spec['weight'], cap, 'count')
+                    new_box.add_item(owner_id, create_person_info(to_add), to_add * person_weight, to_add)
+                    all_sub_containers.append(new_box)
+                    open_person_boxes[owner_id].append(new_box)
+                    remaining -= to_add
+                    added_total += to_add
 
-        logger.info("预处理完成，生成小箱总数=%s", len(all_sub_containers))
-        original_boxes = all_sub_containers.copy()
+                return added_total
 
-        for i, box in enumerate(original_boxes):
-            if box.weight > max_weight_per_sc + 1e-6 or box.length_unit > max_length_per_sc + 1e-6:
-                raise AlgorithmError(
-                    f"Box_{i + 1:04d} 自身超过单车限制：weight={box.weight:.1f}, length={box.length_unit:.2f}"
-                )
+            for comp in companies:
+                cid = comp['organizationID']
+                u_class = safe_int(comp.get('Unitclass'), 5)
+                p_count = safe_int(comp.get('personCount'), 0)
+                remaining_p = p_count
 
-        def create_merged_box(box_list):
-            first = box_list[0]
-            if first.box_type.startswith('Person_Box'):
-                merged = SubContainer(first.box_type, 0.0, 0.0, first.max_capacity, first.capacity_type)
-            elif first.box_type == 'Equip_Box_Small':
-                merged = SubContainer(first.box_type, 0.0, 0.0, first.max_capacity, first.capacity_type, category=first.equip_category)
-            else:
-                raise ValueError(f"不支持合并的箱子类型: {first.box_type}")
-
-            merged.length_unit = sum(b.length_unit for b in box_list)
-            merged.weight = sum(b.weight for b in box_list)
-            merged.owners = first.owners.copy()
-            merged.contents = []
-            for b in box_list:
-                merged.contents.extend(b.contents)
-            return merged
-
-        def can_merge(box_list):
-            total_len = sum(b.length_unit for b in box_list)
-            total_weight = sum(b.weight for b in box_list)
-            return (total_len <= max_length_per_sc + 1e-6 and total_weight <= max_weight_per_sc + 1e-6)
-
-        group_dict = defaultdict(list)
-        for idx, box in enumerate(original_boxes):
-            if box.is_mixed:
-                group_dict[('mixed', idx)].append(idx)
-            else:
-                cid = list(box.owners)[0]
-                cat = getattr(box, 'equip_category', None)
-                if box.box_type == 'Equip_Box_Large':
-                    group_dict[('large', idx)].append(idx)
+                # --- A. 人员装箱 ---
+                if u_class == 2:
+                    c2_cap = box_specs.get('Person_Box_C2', {}).get('capacity', 40)
+                    c2_quota = 2 * c2_cap
+                    if remaining_p > 0:
+                        to_c2 = min(remaining_p, c2_quota)
+                        add_people_to_boxes('Person_Box_C2', to_c2, cid)
+                        remaining_p -= to_c2
+                    if remaining_p > 0:
+                        add_people_to_boxes('Person_Box_C3', remaining_p, cid)
                 else:
-                    group_dict[(cid, box.box_type, cat)].append(idx)
+                    if u_class == 1:
+                        mandatory = {'Person_Box_C1': 1, 'Person_Box_C2': 3, 'Person_Box_C3': 1}
+                    elif u_class == 3:
+                        mandatory = {'Person_Box_C2': 2, 'Person_Box_C3': 1}
+                    elif u_class == 4:
+                        mandatory = {'Person_Box_C2': 1, 'Person_Box_C3': 1}
+                    else:
+                        mandatory = {'Person_Box_C3': 1}
 
-        merged_boxes = []
-        merge_map = []
+                    for b_type, count in mandatory.items():
+                        for _ in range(count):
+                            if remaining_p > 0:
+                                cap = box_specs.get(b_type, {}).get('capacity', 0)
+                                to_add = min(remaining_p, cap)
+                                add_people_to_boxes(b_type, to_add, cid)
+                                remaining_p -= to_add
+                            else:
+                                add_people_to_boxes(b_type, 0, cid)
 
-        for key, indices in group_dict.items():
-            if key[0] in ('mixed', 'large'):
+                    if remaining_p > 0:
+                        add_people_to_boxes('Person_Box_C3', remaining_p, cid)
+
+                # --- B. 大型器械装箱：只允许同公司大型器械复用同公司已打开大箱 ---
+                comps_list = comp.get('componentList', [])
+                comps_list.sort(key=lambda x: x.get('needcarLarge', 0), reverse=True)
+                spec_large = box_specs.get('Equip_Box_Large')
+
+                if spec_large:
+                    for item in comps_list:
+                        name = item['componentname']
+                        w = float(item['componentweight'])
+                        occupancy = float(item.get('needcarLarge', 1.0))
+
+                        item_info = {
+                            "type": "component",
+                            "company_id": cid,
+                            "componentname": name,
+                            "componentID": item.get('componentID', ''),
+                            "zzbdid": item.get('zzbdid', ''),
+                            "bddxid": item.get('bddxid', ''),
+                            "dxcode": item.get('dxcode', ''),
+                            "is_chaoXian": normalize_is_chaoxian(item.get('is_chaoXian', '')),
+                            "occupancy": occupancy
+                        }
+
+                        best_box = None
+                        min_rem = 1.0
+                        for box in open_large_boxes[cid]:
+                            if box.current_load + occupancy <= 1.001:
+                                rem = 1.0 - (box.current_load + occupancy)
+                                if rem < min_rem:
+                                    min_rem = rem
+                                    best_box = box
+
+                        if best_box:
+                            best_box.add_item(cid, item_info, w, occupancy)
+                        else:
+                            new_box = SubContainer('Equip_Box_Large', spec_large['length_unit'], spec_large['weight'], 1.0, 'occupancy')
+                            new_box.add_item(cid, item_info, w, occupancy)
+                            all_sub_containers.append(new_box)
+                            open_large_boxes[cid].append(new_box)
+
+                # --- C. 小物资装箱：按公司 + 类别隔离 ---
+                goods_list = comp.get('goodsList', [])
+                flat_goods = []
+                for g in goods_list:
+                    count = safe_int(g.get('count', 1), 1)
+                    for _ in range(count):
+                        flat_goods.append(g.copy())
+
+                flat_goods.sort(key=lambda x: x.get('tj', 0), reverse=True)
+                spec_small = box_specs.get('Equip_Box_Small')
+
+                if spec_small:
+                    max_vol = float(spec_small.get('capacity_volume', 120.0))
+                    for item in flat_goods:
+                        name = item['name']
+                        w = float(item['weight'])
+                        vol = float(item.get('tj', 0))
+                        cat = item.get('category', '未分类')
+
+                        item_info = {
+                            "type": "goods",
+                            "company_id": cid,
+                            "name": name,
+                            "ID": item.get('ID', ''),
+                            "category": cat,
+                            "count": 1
+                        }
+
+                        key = (cid, cat)
+                        placed = False
+                        for box in open_small_boxes[key]:
+                            if box.current_load + vol <= max_vol + 1e-6:
+                                box.add_item(cid, item_info, w, vol)
+                                placed = True
+                                break
+
+                        if not placed:
+                            new_box = SubContainer(
+                                'Equip_Box_Small',
+                                spec_small['length_unit'],
+                                spec_small['weight'],
+                                max_vol,
+                                'volume',
+                                category=cat
+                            )
+                            new_box.add_item(cid, item_info, w, vol)
+                            all_sub_containers.append(new_box)
+                            open_small_boxes[key].append(new_box)
+
+            print(f"预处理完成，生成小箱总数: {len(all_sub_containers)}")
+
+            # ==========================================
+            # 保存原始箱子，并建立合并映射
+            # ==========================================
+            original_boxes = all_sub_containers.copy()
+
+            # 单箱硬校验：任何一个小箱自身超过单车上限都无解。
+            for i, box in enumerate(original_boxes):
+                if box.weight > max_weight_per_sc + 1e-6 or box.length_unit > max_length_per_sc + 1e-6:
+                    raise ValueError(
+                        f"Box_{i + 1:04d} 自身超过单车限制：weight={box.weight:.1f}, length={box.length_unit:.2f}"
+                    )
+
+            def create_merged_box(box_list):
+                first = box_list[0]
+                if first.box_type.startswith('Person_Box'):
+                    merged = SubContainer(first.box_type, 0.0, 0.0, first.max_capacity, first.capacity_type)
+                elif first.box_type == 'Equip_Box_Small':
+                    merged = SubContainer(first.box_type, 0.0, 0.0, first.max_capacity, first.capacity_type, category=first.equip_category)
+                else:
+                    raise ValueError(f"不支持合并的箱子类型: {first.box_type}")
+
+                merged.length_unit = sum(b.length_unit for b in box_list)
+                merged.weight = sum(b.weight for b in box_list)
+                merged.owners = first.owners.copy()
+                merged.contents = []
+                for b in box_list:
+                    merged.contents.extend(b.contents)
+                return merged
+
+            def can_merge(box_list):
+                total_len = sum(b.length_unit for b in box_list)
+                total_weight = sum(b.weight for b in box_list)
+                return (total_len <= max_length_per_sc + 1e-6 and
+                        total_weight <= max_weight_per_sc + 1e-6)
+
+            # 合并只用于减少启发式装车颗粒度；输出仍展开为原始箱子，保证出参格式不变。
+            group_dict = defaultdict(list)
+            for idx, box in enumerate(original_boxes):
+                if box.is_mixed:
+                    group_dict[('mixed', idx)].append(idx)
+                else:
+                    cid = list(box.owners)[0]
+                    cat = getattr(box, 'equip_category', None)
+                    if box.box_type == 'Equip_Box_Large':
+                        # 大箱已经按 occupancy 装到单箱，不再跨箱合并。
+                        group_dict[('large', idx)].append(idx)
+                    else:
+                        group_dict[(cid, box.box_type, cat)].append(idx)
+
+            merged_boxes = []
+            merge_map = []  # 合并箱索引 → 原始箱索引列表
+
+            for key, indices in group_dict.items():
+                if key[0] in ('mixed', 'large'):
+                    for idx in indices:
+                        merged_boxes.append(original_boxes[idx])
+                        merge_map.append([idx])
+                    continue
+
+                current_group = []
                 for idx in indices:
-                    merged_boxes.append(original_boxes[idx])
-                    merge_map.append([idx])
-                continue
-
-            current_group = []
-            current_group_indices = []
-            for idx in indices:
-                current_box = original_boxes[idx]
-                if current_group and can_merge(current_group + [current_box]):
-                    current_group.append(current_box)
-                    current_group_indices.append(idx)
-                else:
-                    if current_group:
-                        merged_box = create_merged_box(current_group)
-                        merged_boxes.append(merged_box)
-                        merge_map.append(list(current_group_indices))
-                    current_group = [current_box]
-                    current_group_indices = [idx]
-            if current_group:
-                merged_box = create_merged_box(current_group)
-                merged_boxes.append(merged_box)
-                merge_map.append(list(current_group_indices))
-
-        print(f"合并后箱子总数: {len(merged_boxes)} (原始: {len(original_boxes)})")
-        all_sub_containers = merged_boxes
-
-        indices_by_company = defaultdict(list)
-        mixed_indices = []
-        for idx, box in enumerate(all_sub_containers):
-            if len(box.owners) == 1:
-                cid = next(iter(box.owners))
-                indices_by_company[cid].append(idx)
-            else:
-                mixed_indices.append(idx)
-
-        units = []
-
-        def make_unit(box_indices, forced_owners=None):
-            owners = set(forced_owners or [])
-            total_w = 0.0
-            total_l = 0.0
-            chao_owners = set()
-            for i in box_indices:
-                b = all_sub_containers[i]
-                owners.update(b.owners)
-                total_w += b.weight
-                total_l += b.length_unit
-                chao_owners.update(box_chaoxian_owners(b))
-            return {
-                'box_indices': list(box_indices),
-                'owners': owners,
-                'weight': total_w,
-                'length': total_l,
-                'dominant': dominant_ratio(total_w, total_l, max_weight_per_sc, max_length_per_sc),
-                'has_chaoXian_equipment': len(chao_owners) > 0,
-                'chaoXian_owners': chao_owners
-            }
-
-        def split_company_into_chunks(cid, box_indices):
-            def can_add_to_chunk(chunk, box_idx):
-                b = all_sub_containers[box_idx]
-                return (chunk['weight'] + b.weight <= max_weight_per_sc + 1e-6 and
-                        chunk['length'] + b.length_unit <= max_length_per_sc + 1e-6)
-
-            def add_box_to_chunk(chunk, box_idx):
-                b = all_sub_containers[box_idx]
-                chunk['box_indices'].append(box_idx)
-                chunk['weight'] += b.weight
-                chunk['length'] += b.length_unit
-                chunk['dominant'] = dominant_ratio(chunk['weight'], chunk['length'], max_weight_per_sc, max_length_per_sc)
-                chunk['chaoXian_owners'].update(box_chaoxian_owners(b))
-                chunk['has_chaoXian_equipment'] = len(chunk['chaoXian_owners']) > 0
-
-            def best_chunk_for_box(chunks, box_idx, prefer_chao_chunk=False):
-                b = all_sub_containers[box_idx]
-                best_k = None
-                best_score = None
-                for k, chunk in enumerate(chunks):
-                    if not can_add_to_chunk(chunk, box_idx):
+                    current_box = original_boxes[idx]
+                    if current_group and can_merge(current_group + [current_box]):
+                        current_group.append(current_box)
+                    else:
+                        if current_group:
+                            merged_box = create_merged_box(current_group)
+                            merged_boxes.append(merged_box)
+                            merge_map.append(list(current_group_indices))
+                        current_group = [current_box]
+                        current_group_indices = [idx]
                         continue
-                    new_w = chunk['weight'] + b.weight
-                    new_l = chunk['length'] + b.length_unit
-                    fill_w = new_w / max_weight_per_sc
-                    fill_l = new_l / max_length_per_sc
-                    score = 0.7 * max(fill_w, fill_l) + 0.3 * min(fill_w, fill_l) - 0.08 * abs(fill_w - fill_l)
-                    if prefer_chao_chunk and chunk.get('has_chaoXian_equipment'):
-                        score += 0.45
+                    current_group_indices.append(idx)
+
+                if current_group:
+                    merged_box = create_merged_box(current_group)
+                    merged_boxes.append(merged_box)
+                    merge_map.append(list(current_group_indices))
+
+            print(f"合并后箱子总数: {len(merged_boxes)} (原始: {len(original_boxes)})")
+            all_sub_containers = merged_boxes
+
+            # ==========================================
+            # 构造“公司整体装车单元”：优先保证同公司人、装备、物资在同车。
+            # 若某公司总重或总换长超过单车上限，才在公司内部拆分为多个 chunk。
+            # ==========================================
+            indices_by_company = defaultdict(list)
+            mixed_indices = []
+            for idx, box in enumerate(all_sub_containers):
+                if len(box.owners) == 1:
+                    cid = next(iter(box.owners))
+                    indices_by_company[cid].append(idx)
+                else:
+                    mixed_indices.append(idx)
+
+            units = []
+
+            def make_unit(box_indices, forced_owners=None):
+                owners = set(forced_owners or [])
+                total_w = 0.0
+                total_l = 0.0
+                chao_owners = set()
+                for i in box_indices:
+                    b = all_sub_containers[i]
+                    owners.update(b.owners)
+                    total_w += b.weight
+                    total_l += b.length_unit
+                    chao_owners.update(box_chaoxian_owners(b))
+                return {
+                    'box_indices': list(box_indices),
+                    'owners': owners,
+                    'weight': total_w,
+                    'length': total_l,
+                    'dominant': dominant_ratio(total_w, total_l, max_weight_per_sc, max_length_per_sc),
+                    # 软规则使用：分车公司中 is_chaoXian="是" 的大型装备尽量集中到同一辆车；
+                    # 不同公司若最终拼在同一辆车且均有超限装备，也优先让这些超限装备同车。
+                    'has_chaoXian_equipment': len(chao_owners) > 0,
+                    'chaoXian_owners': chao_owners
+                }
+
+            def split_company_into_chunks(cid, box_indices):
+                """
+                公司本身超过单车上限时才拆分。
+                新增软规则：若该公司有 is_chaoXian="是" 的大型装备，优先把这些装备所在大箱集中到同一个 chunk；
+                只有这些超限装备本身就超过单车容量时，才被迫拆成多个 chunk。
+                """
+                def can_add_to_chunk(chunk, box_idx):
+                    b = all_sub_containers[box_idx]
+                    return (chunk['weight'] + b.weight <= max_weight_per_sc + 1e-6 and
+                            chunk['length'] + b.length_unit <= max_length_per_sc + 1e-6)
+
+                def add_box_to_chunk(chunk, box_idx):
+                    b = all_sub_containers[box_idx]
+                    chunk['box_indices'].append(box_idx)
+                    chunk['weight'] += b.weight
+                    chunk['length'] += b.length_unit
+                    chunk['dominant'] = dominant_ratio(chunk['weight'], chunk['length'], max_weight_per_sc, max_length_per_sc)
+                    chunk['chaoXian_owners'].update(box_chaoxian_owners(b))
+                    chunk['has_chaoXian_equipment'] = len(chunk['chaoXian_owners']) > 0
+
+                def best_chunk_for_box(chunks, box_idx, prefer_chao_chunk=False):
+                    b = all_sub_containers[box_idx]
+                    best_k = None
+                    best_score = None
+                    for k, chunk in enumerate(chunks):
+                        if not can_add_to_chunk(chunk, box_idx):
+                            continue
+                        new_w = chunk['weight'] + b.weight
+                        new_l = chunk['length'] + b.length_unit
+                        fill_w = new_w / max_weight_per_sc
+                        fill_l = new_l / max_length_per_sc
+                        score = 0.7 * max(fill_w, fill_l) + 0.3 * min(fill_w, fill_l) - 0.08 * abs(fill_w - fill_l)
+                        # 对 is_chaoXian="是" 的装备，优先进入已有超限装备 chunk，避免被拆散。
+                        if prefer_chao_chunk and chunk.get('has_chaoXian_equipment'):
+                            score += 0.45
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_k = k
+                    return best_k
+
+                chao_indices = [i for i in box_indices if box_has_chaoxian_equipment(all_sub_containers[i])]
+                normal_indices = [i for i in box_indices if i not in set(chao_indices)]
+
+                chunks = []
+
+                # 1) 先装 is_chaoXian="是" 的大型装备箱，使其尽量集中。
+                ordered_chao = sorted(
+                    chao_indices,
+                    key=lambda i: (
+                        dominant_ratio(all_sub_containers[i].weight, all_sub_containers[i].length_unit,
+                                       max_weight_per_sc, max_length_per_sc),
+                        all_sub_containers[i].length_unit,
+                        all_sub_containers[i].weight
+                    ),
+                    reverse=True
+                )
+                for idx in ordered_chao:
+                    best_k = best_chunk_for_box(chunks, idx, prefer_chao_chunk=True)
+                    if best_k is None:
+                        chunks.append(make_unit([idx], forced_owners={cid}))
+                    else:
+                        add_box_to_chunk(chunks[best_k], idx)
+
+                # 2) 再装该公司的普通人员/物资/非超限装备箱，优先填充已有 chunk，尽量减少同公司人货分离。
+                ordered_normal = sorted(
+                    normal_indices,
+                    key=lambda i: (
+                        dominant_ratio(all_sub_containers[i].weight, all_sub_containers[i].length_unit,
+                                       max_weight_per_sc, max_length_per_sc),
+                        all_sub_containers[i].length_unit,
+                        all_sub_containers[i].weight
+                    ),
+                    reverse=True
+                )
+                for idx in ordered_normal:
+                    best_k = best_chunk_for_box(chunks, idx, prefer_chao_chunk=False)
+                    if best_k is None:
+                        chunks.append(make_unit([idx], forced_owners={cid}))
+                    else:
+                        add_box_to_chunk(chunks[best_k], idx)
+
+                return chunks
+
+            for cid, box_indices in indices_by_company.items():
+                total_w = sum(all_sub_containers[i].weight for i in box_indices)
+                total_l = sum(all_sub_containers[i].length_unit for i in box_indices)
+                if total_w <= max_weight_per_sc + 1e-6 and total_l <= max_length_per_sc + 1e-6:
+                    units.append(make_unit(box_indices, forced_owners={cid}))
+                else:
+                    units.extend(split_company_into_chunks(cid, box_indices))
+
+            # 理论兼容：若仍有历史混箱，则作为不可拆单元处理。
+            for idx in mixed_indices:
+                units.append(make_unit([idx]))
+
+            print(f"装车单元数: {len(units)} (优先按公司整体成组；超限公司自动拆分)")
+
+            # ==========================================
+            # 车辆装载：Best‑Fit Decreasing + 任意字符串 yingjiName 种类数硬约束 + 公司整体优先
+            # ==========================================
+            def vehicle_score_after_place(vehicle, unit):
+                fill_w = (vehicle.weight + unit['weight']) / max_weight_per_sc
+                fill_l = (vehicle.length + unit['length']) / max_length_per_sc
+                # 兼顾总重和换长利用率，且避免某一维过满、另一维很空。
+                return 0.75 * max(fill_w, fill_l) + 0.25 * min(fill_w, fill_l) - 0.10 * abs(fill_w - fill_l)
+
+            def find_best_vehicle(vehicles, unit, exclude_index=None):
+                best_v = None
+                best_score = None
+                for v, vehicle in enumerate(vehicles):
+                    if exclude_index is not None and v == exclude_index:
+                        continue
+                    if not vehicle.can_place(unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
+                        continue
+                    score = vehicle_score_after_place(vehicle, unit)
+                    # 已包含该公司时加一点偏好，避免同公司被拆到更多车上。
+                    if unit['owners'] & vehicle.companies:
+                        score += 0.15
+                    # 新增软规则：含 is_chaoXian="是" 的装备单元，优先靠近已有超限装备的车辆。
+                    # 这样当多个分车公司被拼到同一辆 SC 时，其超限装备更容易集中在同一辆 SC。
+                    if unit.get('has_chaoXian_equipment'):
+                        if vehicle.chaoXian_companies:
+                            score += 0.45
+                        if unit.get('chaoXian_owners', set()) & vehicle.chaoXian_companies:
+                            score += 0.10
                     if best_score is None or score > best_score:
                         best_score = score
-                        best_k = k
-                return best_k
+                        best_v = v
+                return best_v
 
-            chao_indices = [i for i in box_indices if box_has_chaoxian_equipment(all_sub_containers[i])]
-            normal_indices = [i for i in box_indices if i not in set(chao_indices)]
-            chunks = []
+            units.sort(key=lambda u: (u.get('has_chaoXian_equipment', False), u['dominant'], u['length'], u['weight']), reverse=True)
+            vehicles = []
 
-            ordered_chao = sorted(
-                chao_indices,
-                key=lambda i: (
-                    dominant_ratio(all_sub_containers[i].weight, all_sub_containers[i].length_unit,
-                                   max_weight_per_sc, max_length_per_sc),
-                    all_sub_containers[i].length_unit,
-                    all_sub_containers[i].weight
-                ),
-                reverse=True
-            )
-            for idx in ordered_chao:
-                best_k = best_chunk_for_box(chunks, idx, prefer_chao_chunk=True)
-                if best_k is None:
-                    chunks.append(make_unit([idx], forced_owners={cid}))
+            for unit in units:
+                v = find_best_vehicle(vehicles, unit)
+                if v is None:
+                    new_vehicle = VehicleState()
+                    if not new_vehicle.can_place(unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
+                        owners = ','.join(sorted(unit['owners']))
+                        raise ValueError(
+                            f"装车单元无法单独放入车辆，owners={owners}, "
+                            f"weight={unit['weight']:.1f}, length={unit['length']:.2f}"
+                        )
+                    new_vehicle.place(unit, company_yingji_name)
+                    vehicles.append(new_vehicle)
                 else:
-                    add_box_to_chunk(chunks[best_k], idx)
+                    vehicles[v].place(unit, company_yingji_name)
 
-            ordered_normal = sorted(
-                normal_indices,
-                key=lambda i: (
-                    dominant_ratio(all_sub_containers[i].weight, all_sub_containers[i].length_unit,
-                                   max_weight_per_sc, max_length_per_sc),
-                    all_sub_containers[i].length_unit,
-                    all_sub_containers[i].weight
-                ),
-                reverse=True
-            )
-            for idx in ordered_normal:
-                best_k = best_chunk_for_box(chunks, idx, prefer_chao_chunk=False)
-                if best_k is None:
-                    chunks.append(make_unit([idx], forced_owners={cid}))
-                else:
-                    add_box_to_chunk(chunks[best_k], idx)
-
-            return chunks
-
-        for cid, box_indices in indices_by_company.items():
-            total_w = sum(all_sub_containers[i].weight for i in box_indices)
-            total_l = sum(all_sub_containers[i].length_unit for i in box_indices)
-            if total_w <= max_weight_per_sc + 1e-6 and total_l <= max_length_per_sc + 1e-6:
-                units.append(make_unit(box_indices, forced_owners={cid}))
-            else:
-                units.extend(split_company_into_chunks(cid, box_indices))
-
-        for idx in mixed_indices:
-            units.append(make_unit([idx]))
-
-        print(f"装车单元数: {len(units)} (优先按公司整体成组；超限公司自动拆分)")
-
-        def vehicle_score_after_place(vehicle, unit):
-            fill_w = (vehicle.weight + unit['weight']) / max_weight_per_sc
-            fill_l = (vehicle.length + unit['length']) / max_length_per_sc
-            return 0.75 * max(fill_w, fill_l) + 0.25 * min(fill_w, fill_l) - 0.10 * abs(fill_w - fill_l)
-
-        def find_best_vehicle(vehicles, unit, exclude_index=None):
-            best_v = None
-            best_score = None
-            for v, vehicle in enumerate(vehicles):
-                if exclude_index is not None and v == exclude_index:
-                    continue
-                if not vehicle.can_place(unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
-                    continue
-                score = vehicle_score_after_place(vehicle, unit)
-                if unit['owners'] & vehicle.companies:
-                    score += 0.15
-                if unit.get('has_chaoXian_equipment'):
-                    if vehicle.chaoXian_companies:
-                        score += 0.45
-                    if unit.get('chaoXian_owners', set()) & vehicle.chaoXian_companies:
-                        score += 0.10
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_v = v
-            return best_v
-
-        units.sort(key=lambda u: (u.get('has_chaoXian_equipment', False), u['dominant'], u['length'], u['weight']), reverse=True)
-        vehicles = []
-
-        for unit in units:
-            v = find_best_vehicle(vehicles, unit)
-            if v is None:
-                new_vehicle = VehicleState()
-                if not new_vehicle.can_place(unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
-                    owners = ','.join(sorted(unit['owners']))
-                    raise AlgorithmError(
-                        f"装车单元无法单独放入车辆，owners={owners}, weight={unit['weight']:.1f}, length={unit['length']:.2f}"
+            # ==========================================
+            # 压实改进：尝试清空低利用率车辆，减少车辆数并提升容量利用。
+            # ==========================================
+            def compact_vehicles(vehicles):
+                changed = True
+                while changed:
+                    changed = False
+                    order = sorted(
+                        range(len(vehicles)),
+                        key=lambda i: (dominant_ratio(vehicles[i].weight, vehicles[i].length,
+                                                       max_weight_per_sc, max_length_per_sc), len(vehicles[i].units))
                     )
-                new_vehicle.place(unit, company_yingji_name)
-                vehicles.append(new_vehicle)
-            else:
-                vehicles[v].place(unit, company_yingji_name)
+                    for source_idx in order:
+                        if source_idx >= len(vehicles):
+                            continue
+                        source_units = sorted(
+                            list(vehicles[source_idx].units),
+                            key=lambda u: (u['dominant'], u['length'], u['weight']),
+                            reverse=True
+                        )
+                        snapshot = [v.clone() for v in vehicles]
+                        success = True
+                        for unit in source_units:
+                            vehicles[source_idx].remove(unit, company_yingji_name)
+                            target_idx = find_best_vehicle(vehicles, unit, exclude_index=source_idx)
+                            if target_idx is None:
+                                success = False
+                                break
+                            vehicles[target_idx].place(unit, company_yingji_name)
 
-        def compact_vehicles(vehicles):
-            changed = True
-            while changed:
-                changed = False
-                order = sorted(
-                    range(len(vehicles)),
-                    key=lambda i: (dominant_ratio(vehicles[i].weight, vehicles[i].length,
-                                                   max_weight_per_sc, max_length_per_sc), len(vehicles[i].units))
-                )
-                for source_idx in order:
-                    if source_idx >= len(vehicles):
-                        continue
-                    source_units = sorted(
-                        list(vehicles[source_idx].units),
-                        key=lambda u: (u['dominant'], u['length'], u['weight']),
-                        reverse=True
-                    )
-                    snapshot = [v.clone() for v in vehicles]
-                    success = True
-                    for unit in source_units:
-                        vehicles[source_idx].remove(unit, company_yingji_name)
-                        target_idx = find_best_vehicle(vehicles, unit, exclude_index=source_idx)
-                        if target_idx is None:
-                            success = False
+                        if success and not vehicles[source_idx].units:
+                            del vehicles[source_idx]
+                            changed = True
                             break
-                        vehicles[target_idx].place(unit, company_yingji_name)
+                        else:
+                            vehicles = snapshot
+                    # while loop uses possibly replaced local vehicles
+                return vehicles
 
-                    if success and not vehicles[source_idx].units:
-                        del vehicles[source_idx]
-                        changed = True
-                        break
-                    else:
-                        vehicles = snapshot
-            return vehicles
+            vehicles = compact_vehicles(vehicles)
+            total_sc_used = len(vehicles)
+            print(f"启发式装车完成，使用 SC 总数: {total_sc_used}")
 
-        vehicles = compact_vehicles(vehicles)
-        total_sc_used = len(vehicles)
-        print(f"启发式装车完成，使用 SC 总数: {total_sc_used}")
-
-        heuristic_assign = [-1] * len(all_sub_containers)
-        for v, vehicle in enumerate(vehicles):
-            for unit in vehicle.units:
-                for idx in unit['box_indices']:
-                    if heuristic_assign[idx] != -1:
-                        raise AlgorithmError(f"合并箱 {idx} 被重复分配")
-                    heuristic_assign[idx] = v
-
-        def validate_assignment():
-            if any(v == -1 for v in heuristic_assign):
-                missing = [i for i, v in enumerate(heuristic_assign) if v == -1]
-                raise AlgorithmError(f"存在未分配合并箱: {missing[:10]}")
-
+            # 合并箱 → 车辆索引
+            heuristic_assign = [-1] * len(all_sub_containers)
             for v, vehicle in enumerate(vehicles):
-                if vehicle.weight > max_weight_per_sc + 1e-6:
-                    raise AlgorithmError(f"SC_{v + 1:03d} 超重: {vehicle.weight:.1f} > {max_weight_per_sc:.1f}")
-                if vehicle.length > max_length_per_sc + 1e-6:
-                    raise AlgorithmError(f"SC_{v + 1:03d} 超换长: {vehicle.length:.2f} > {max_length_per_sc:.2f}")
-                used_yingji_names = sorted(
-                    y for y, cids in vehicle.yingji_companies.items()
-                    if y in ('1', '2', '3') and len(cids) > 0
-                )
-                if len(used_yingji_names) > 2:
-                    raise AlgorithmError(f"SC_{v + 1:03d} yingjiName种类数超限: used_yingjiNames={used_yingji_names}")
+                for unit in vehicle.units:
+                    for idx in unit['box_indices']:
+                        if heuristic_assign[idx] != -1:
+                            raise RuntimeError(f"合并箱 {idx} 被重复分配")
+                        heuristic_assign[idx] = v
 
-            spread = defaultdict(set)
-            for idx, assign in enumerate(heuristic_assign):
-                for cid in all_sub_containers[idx].owners:
-                    spread[cid].add(assign)
-            split_companies = {cid: sorted(vs) for cid, vs in spread.items() if len(vs) > 1}
-            if split_companies:
-                print("提示：以下公司因容量/装载组合原因被分到多辆车（软约束，已尽量压缩）：")
-                for cid, vs in list(split_companies.items())[:20]:
-                    print(f"  {cid}: {len(vs)} 辆 -> {[f'SC_{v + 1:03d}' for v in vs]}")
-                if len(split_companies) > 20:
-                    print(f"  ... 共 {len(split_companies)} 个公司")
+            # ==========================================
+            # 硬约束校验
+            # ==========================================
+            def validate_assignment():
+                if any(v == -1 for v in heuristic_assign):
+                    missing = [i for i, v in enumerate(heuristic_assign) if v == -1]
+                    raise RuntimeError(f"存在未分配合并箱: {missing[:10]}")
 
-        validate_assignment()
+                for v, vehicle in enumerate(vehicles):
+                    if vehicle.weight > max_weight_per_sc + 1e-6:
+                        raise RuntimeError(
+                            f"SC_{v + 1:03d} 超重: {vehicle.weight:.1f} > {max_weight_per_sc:.1f}"
+                        )
+                    if vehicle.length > max_length_per_sc + 1e-6:
+                        raise RuntimeError(
+                            f"SC_{v + 1:03d} 超换长: {vehicle.length:.2f} > {max_length_per_sc:.2f}"
+                        )
+                    used_yingji_names = sorted(
+                        y for y, cids in vehicle.yingji_companies.items()
+                        if is_effective_yingji_name(y) and len(cids) > 0
+                    )
+                    if len(used_yingji_names) > 2:
+                        raise RuntimeError(
+                            f"SC_{v + 1:03d} yingjiName种类数超限: used_yingjiNames={used_yingji_names}"
+                        )
 
-        if vehicles:
-            avg_w = sum(v.weight / max_weight_per_sc for v in vehicles) / len(vehicles)
-            avg_l = sum(v.length / max_length_per_sc for v in vehicles) / len(vehicles)
-            print(f"平均重量利用率: {avg_w:.2%}，平均换长利用率: {avg_l:.2%}")
+                # 统计同公司分布，仅作为软规则检查：能一车装下的公司理论上应尽量只出现在一车。
+                spread = defaultdict(set)
+                for idx, assign in enumerate(heuristic_assign):
+                    for cid in all_sub_containers[idx].owners:
+                        spread[cid].add(assign)
+                split_companies = {cid: sorted(vs) for cid, vs in spread.items() if len(vs) > 1}
+                if split_companies:
+                    print("提示：以下公司因容量/装载组合原因被分到多辆车（软约束，已尽量压缩）：")
+                    for cid, vs in list(split_companies.items())[:20]:
+                        print(f"  {cid}: {len(vs)} 辆 -> {[f'SC_{v + 1:03d}' for v in vs]}")
+                    if len(split_companies) > 20:
+                        print(f"  ... 共 {len(split_companies)} 个公司")
 
-        res_data = {
-            "code": 0,
-            "msg": "success",
-            "data": {
-                "total_SC_used": total_sc_used,
-                "SC_list": []
-            }
-        }
+            validate_assignment()
 
-        for v in range(total_sc_used):
-            sc_info = {
-                "SC_ID": f"SC_{v + 1:03d}",
-                "summary": {},
-                "box_list": []
-            }
+            if vehicles:
+                avg_w = sum(v.weight / max_weight_per_sc for v in vehicles) / len(vehicles)
+                avg_l = sum(v.length / max_length_per_sc for v in vehicles) / len(vehicles)
+                print(f"平均重量利用率: {avg_w:.2%}，平均换长利用率: {avg_l:.2%}")
 
-            owners_set = set()
-            curr_w = 0.0
-            curr_l = 0.0
-            has_mixed = False
-
-            merged_indices = [i for i, assign in enumerate(heuristic_assign) if assign == v]
-            for i in merged_indices:
-                for orig_idx in merge_map[i]:
-                    orig_box = original_boxes[orig_idx]
-                    owners_set.update(orig_box.owners)
-                    curr_w += orig_box.weight
-                    curr_l += orig_box.length_unit
-                    if orig_box.is_mixed:
-                        has_mixed = True
-
-                    entity_desc = build_entities(orig_box, company_yingji_name)
-
-                    box_yingji_names = sorted({
-                        company_yingji_name.get(cid, '') for cid in orig_box.owners
-                        if company_yingji_name.get(cid, '') in ('1', '2', '3')
-                    })
-                    box_dict = {
-                        "box_id": f"Box_{orig_idx + 1:04d}",
-                        "box_type": orig_box.box_type,
-                        "is_mixed": orig_box.is_mixed,
-                        "owners": list(orig_box.owners),
-                        "yingjiName": ';'.join(box_yingji_names),
-                        "is_chaoXian": "是" if box_has_chaoxian_equipment(orig_box) else ("否" if orig_box.box_type == 'Equip_Box_Large' else ""),
-                        "content_desc": entity_desc,
-                        "weight": round(orig_box.weight, 1),
-                        "length_unit": round(orig_box.length_unit, 2)
-                    }
-
-                    if orig_box.box_type == 'Equip_Box_Small':
-                        box_dict["category"] = getattr(orig_box, 'equip_category', '未分类')
-
-                    sc_info["box_list"].append(box_dict)
-
-            yingji_names_in_sc = sorted({
-                company_yingji_name.get(cid, '') for cid in owners_set
-                if company_yingji_name.get(cid, '') in ('1', '2', '3')
-            })
-            yingji_company_distribution = {}
-            for y in yingji_names_in_sc:
-                yingji_company_distribution[y] = len([cid for cid in owners_set if company_yingji_name.get(cid, '') == y])
-
-            chao_companies_in_sc = sorted({
-                entity.get('company_id', '')
-                for box in sc_info['box_list']
-                for entity in box.get('content_desc', [])
-                if entity.get('type') == 'component' and entity.get('is_chaoXian', '') == '是'
-            } - {''})
-
-            sc_info["summary"] = {
-                "companies_included": list(owners_set),
-                "yingjiName_list": yingji_names_in_sc,
-                "yingjiName_count": len(yingji_names_in_sc),
-                "yingjiName_company_distribution": yingji_company_distribution,
-                "has_chaoXian_equipment": len(chao_companies_in_sc) > 0,
-                "chaoXian_companies": chao_companies_in_sc,
-                "total_weight": round(curr_w, 1),
-                "total_length_unit": round(curr_l, 2),
-                "has_mixed_box": has_mixed,
-                "description": f"包含 {len(owners_set)} 个公司: {','.join(list(owners_set)[:3])}... 共 {len(sc_info['box_list'])} 个小箱"
+            # ==========================================
+            # 构建输出 JSON（展开为原始箱子，出参格式不变）
+            # ==========================================
+            res_data = {
+                "code": 0,
+                "msg": "success",
+                "data": {
+                    "total_SC_used": total_sc_used,
+                    "SC_list": []
+                }
             }
 
-            res_data["data"]["SC_list"].append(sc_info)
+            for v in range(total_sc_used):
+                sc_info = {
+                    "SC_ID": f"SC_{v + 1:03d}",
+                    "summary": {},
+                    "box_list": []
+                }
 
-        validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max_length_per_sc)
-        return res_data
+                owners_set = set()
+                curr_w = 0.0
+                curr_l = 0.0
+                has_mixed = False
+
+                merged_indices = [i for i, assign in enumerate(heuristic_assign) if assign == v]
+                for i in merged_indices:
+                    for orig_idx in merge_map[i]:
+                        orig_box = original_boxes[orig_idx]
+                        owners_set.update(orig_box.owners)
+                        curr_w += orig_box.weight
+                        curr_l += orig_box.length_unit
+                        if orig_box.is_mixed:
+                            has_mixed = True
+
+                        entity_desc = build_entities(orig_box, company_yingji_name)
+
+                        box_yingji_names = sorted({
+                            company_yingji_name.get(cid, '') for cid in orig_box.owners
+                            if is_effective_yingji_name(company_yingji_name.get(cid, ''))
+                        })
+                        box_dict = {
+                            "box_id": f"Box_{orig_idx + 1:04d}",
+                            "box_type": orig_box.box_type,
+                            "is_mixed": orig_box.is_mixed,
+                            "owners": list(orig_box.owners),
+                            "yingjiName": ';'.join(box_yingji_names),
+                            "is_chaoXian": "是" if box_has_chaoxian_equipment(orig_box) else ("否" if orig_box.box_type == 'Equip_Box_Large' else ""),
+                            "content_desc": entity_desc,
+                            "weight": round(orig_box.weight, 1),
+                            "length_unit": round(orig_box.length_unit, 2)
+                        }
+
+                        if orig_box.box_type == 'Equip_Box_Small':
+                            box_dict["category"] = getattr(orig_box, 'equip_category', '未分类')
+
+                        sc_info["box_list"].append(box_dict)
+
+                yingji_names_in_sc = sorted({
+                    company_yingji_name.get(cid, '') for cid in owners_set
+                    if is_effective_yingji_name(company_yingji_name.get(cid, ''))
+                })
+                yingji_company_distribution = {}
+                for y in yingji_names_in_sc:
+                    yingji_company_distribution[y] = len([cid for cid in owners_set if company_yingji_name.get(cid, '') == y])
+
+                chao_companies_in_sc = sorted({
+                    entity.get('company_id', '')
+                    for box in sc_info['box_list']
+                    for entity in box.get('content_desc', [])
+                    if entity.get('type') == 'component' and entity.get('is_chaoXian', '') == '是'
+                } - {''})
+
+                sc_info["summary"] = {
+                    "companies_included": list(owners_set),
+                    "yingjiName_list": yingji_names_in_sc,
+                    "yingjiName_count": len(yingji_names_in_sc),
+                    "yingjiName_company_distribution": yingji_company_distribution,
+                    "has_chaoXian_equipment": len(chao_companies_in_sc) > 0,
+                    "chaoXian_companies": chao_companies_in_sc,
+                    "total_weight": round(curr_w, 1),
+                    "total_length_unit": round(curr_l, 2),
+                    "has_mixed_box": has_mixed,
+                    "description": f"包含 {len(owners_set)} 个公司: {','.join(list(owners_set)[:3])}... 共 {len(sc_info['box_list'])} 个小箱"
+                }
+
+                res_data["data"]["SC_list"].append(sc_info)
+
+            # 最后再按出参结果复核一遍，确保写出的 summary 未超限、yingjiName种类数未超限。
+            validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max_length_per_sc)
+
+            return res_data
+
+
     except AlgorithmError as exc:
         logger.warning("算法输入错误: %s", exc)
         return {"code": 1, "msg": str(exc)}
@@ -948,17 +1033,17 @@ def validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max
         total_w = float(summary.get('total_weight', 0.0))
         total_l = float(summary.get('total_length_unit', 0.0))
         if total_w > max_weight_per_sc + 1e-6:
-            raise AlgorithmError(f"{sid} 出参校验超重: {total_w:.1f} > {max_weight_per_sc:.1f}")
+            raise RuntimeError(f"{sid} 出参校验超重: {total_w:.1f} > {max_weight_per_sc:.1f}")
         if total_l > max_length_per_sc + 1e-6:
-            raise AlgorithmError(f"{sid} 出参校验超换长: {total_l:.2f} > {max_length_per_sc:.2f}")
+            raise RuntimeError(f"{sid} 出参校验超换长: {total_l:.2f} > {max_length_per_sc:.2f}")
 
         used_yingji_names = set()
         for cid in summary.get('companies_included', []):
             yingji_name = company_yingji_name.get(cid, '')
-            if yingji_name in ('1', '2', '3'):
+            if is_effective_yingji_name(yingji_name):
                 used_yingji_names.add(yingji_name)
         if len(used_yingji_names) > 2:
-            raise AlgorithmError(f"{sid} 出参校验yingjiName种类数超限: used_yingjiNames={sorted(used_yingji_names)}")
+            raise RuntimeError(f"{sid} 出参校验yingjiName种类数超限: used_yingjiNames={sorted(used_yingji_names)}")
 
 
 def build_entities(box, company_yingji_name=None):
@@ -1017,10 +1102,8 @@ def build_entities(box, company_yingji_name=None):
     return entities
 
 
-ALGO_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_ALGO_WORKERS, thread_name_prefix="algo-worker")
-ALGO_GATE = threading.BoundedSemaphore(MAX_ALGO_WORKERS)
-atexit.register(ALGO_EXECUTOR.shutdown, wait=False, cancel_futures=False)
 
+atexit.register(ALGO_EXECUTOR.shutdown, wait=False, cancel_futures=False)
 
 def build_cors_origins() -> List[str]:
     raw = os.getenv("RAILWAY_CORS_ALLOW_ORIGINS", "*").strip()
