@@ -1,6 +1,9 @@
+
 import asyncio
 import atexit
 import logging
+import math
+from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
@@ -8,13 +11,15 @@ from functools import partial
 import signal
 import socket
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
+from uuid import uuid4
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from ortools.linear_solver import pywraplp
 from pydantic import BaseModel, ConfigDict
 
 
@@ -26,8 +31,8 @@ HEALTH_PATH = "/health"
 LOG_FILE_NAME = "railway_service_linux.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
-MAX_ALGO_WORKERS = 1
-DEFAULT_SOLVER_TIME_LIMIT_MS = 30000
+MAX_ALGO_WORKERS = 5
+REQUEST_TIMEOUT_SECONDS = 45.0
 
 
 def get_app_dir() -> Path:
@@ -45,7 +50,6 @@ def ensure_log_dir() -> None:
 
 
 ensure_log_dir()
-
 
 logger = logging.getLogger("railway_service_linux")
 logger.setLevel(logging.INFO)
@@ -84,6 +88,9 @@ class StreamToLogger:
             self.log_obj.log(self.level, line)
         self._buffer = ""
 
+    def isatty(self) -> bool:
+        return False
+
 
 sys.stdout = StreamToLogger(logger, logging.INFO)
 sys.stderr = StreamToLogger(logger, logging.ERROR)
@@ -102,7 +109,7 @@ def _threading_excepthook(args) -> None:
     logger.exception("线程未捕获异常", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 
 
-if hasattr(threading := __import__("threading"), "excepthook"):
+if hasattr(threading, "excepthook"):
     threading.excepthook = _threading_excepthook
 
 
@@ -147,7 +154,7 @@ def model_to_payload(model: Any) -> Dict[str, Any]:
     raise TypeError(f"不支持的请求模型类型: {type(model)}")
 
 
-# ========================== 算法核心 ==========================
+# ========================== 算法核心（5.7 启发式） ==========================
 class SubContainer:
     def __init__(self, box_type, length_unit, weight_empty, max_capacity, capacity_type="count", category=None):
         self.box_type = box_type
@@ -178,20 +185,7 @@ class AlgorithmError(Exception):
     pass
 
 
-ALGO_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_ALGO_WORKERS, thread_name_prefix="algo-worker")
-
-
-def _get_objective_value(solver: pywraplp.Solver) -> float:
-    obj = solver.Objective()
-    if hasattr(obj, "Value"):
-        return obj.Value()
-    return obj.value()
-
-
 def build_entities(box: "SubContainer") -> List[Dict[str, Any]]:
-    """
-    将 box.contents 转换为 4.23 结构下的实体列表。
-    """
     if not box.contents:
         return []
 
@@ -213,17 +207,18 @@ def build_entities(box: "SubContainer") -> List[Dict[str, Any]]:
 
     elif box.box_type == "Equip_Box_Large":
         for item in box.contents:
-            entity = {
-                "type": "component",
-                "company_id": item["company_id"],
-                "componentname": item["componentname"],
-                "componentID": item.get("componentID", ""),
-                "zzbdid": item.get("zzbdid", ""),
-                "bddxid": item.get("bddxid", ""),
-                "dxcode": item.get("dxcode", ""),
-                "occupancy": item["occupancy"],
-            }
-            entities.append(entity)
+            entities.append(
+                {
+                    "type": "component",
+                    "company_id": item["company_id"],
+                    "componentname": item["componentname"],
+                    "componentID": item.get("componentID", ""),
+                    "zzbdid": item.get("zzbdid", ""),
+                    "bddxid": item.get("bddxid", ""),
+                    "dxcode": item.get("dxcode", ""),
+                    "occupancy": item["occupancy"],
+                }
+            )
 
     elif box.box_type == "Equip_Box_Small":
         merged = {}
@@ -256,6 +251,11 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         if missing_specs:
             raise AlgorithmError(f"缺少箱型配置: {', '.join(missing_specs)}")
 
+        max_weight_per_sc = sc_limit.get("maxWeightLimit", 60000)
+        max_length_per_sc = sc_limit.get("maxLengthLimit", 800.0)
+        if max_weight_per_sc <= 0 or max_length_per_sc <= 0:
+            raise AlgorithmError("SC 约束配置非法")
+
         all_sub_containers: List[SubContainer] = []
         open_person_boxes: List[SubContainer] = []
         open_large_boxes: List[SubContainer] = []
@@ -265,7 +265,6 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             spec = box_specs.get(b_type)
             if not spec or num_people <= 0:
                 return 0
-
             cap = spec["capacity"]
             remaining = num_people
             added_total = 0
@@ -275,13 +274,13 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     "type": "person",
                     "company_id": owner_id,
                     "box_type": b_type,
-                    "count": int(count),
+                    "count": count,
                 }
 
             for box in open_person_boxes:
                 if box.box_type == b_type and box.current_load < box.max_capacity:
-                    available_space = box.max_capacity - box.current_load
-                    to_add = min(remaining, available_space)
+                    space = box.max_capacity - box.current_load
+                    to_add = min(remaining, space)
                     if to_add > 0:
                         box.add_item(owner_id, create_person_info(to_add), to_add * person_weight, to_add)
                         remaining -= to_add
@@ -301,6 +300,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             return added_total
 
         companies = raw_data.get("data", [])
+
         for comp in companies:
             cid = comp["organizationID"]
             try:
@@ -308,7 +308,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 u_class = 5
 
-            remaining_p = int(comp.get("personCount", 0))
+            remaining_p = comp.get("personCount", 0)
 
             if u_class == 2:
                 c2_cap = box_specs.get("Person_Box_C2", {}).get("capacity", 40)
@@ -388,7 +388,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             goods_list = comp.get("goodsList", [])
             flat_goods: List[Dict[str, Any]] = []
             for g in goods_list:
-                count = int(g.get("count", 1))
+                count = g.get("count", 1)
                 for _ in range(count):
                     flat_goods.append(g.copy())
 
@@ -437,118 +437,203 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
         logger.info("预处理完成，生成小箱总数=%s", len(all_sub_containers))
 
-        solver = pywraplp.Solver.CreateSolver("SCIP")
-        if not solver:
-            return {"code": 1, "msg": "求解器未启动"}
+        company_totals: Dict[str, Dict[str, float]] = {}
+        for box in all_sub_containers:
+            for owner in box.owners:
+                if owner not in company_totals:
+                    company_totals[owner] = {"weight": 0.0, "length": 0.0}
+                company_totals[owner]["weight"] += box.weight
+                company_totals[owner]["length"] += box.length_unit
 
-        total_len = sum(b.length_unit for b in all_sub_containers)
-        max_sc_len = sc_limit["maxLengthLimit"]
-        est_bins = int(total_len / max_sc_len) + 20
+        company_max_vehicles: Dict[str, int] = {}
+        for cid, totals in company_totals.items():
+            needed_for_weight = math.ceil(totals["weight"] / max_weight_per_sc)
+            needed_for_length = math.ceil(totals["length"] / max_length_per_sc)
+            min_needed = max(1, needed_for_weight, needed_for_length)
+            company_max_vehicles[cid] = max(2, min_needed)
 
-        sc_ids = range(est_bins)
-        box_ids = range(len(all_sub_containers))
-        comp_map = {c["organizationID"]: idx for idx, c in enumerate(companies)}
-        comp_ids = comp_map.values()
+        special_limits = {cid: max_v for cid, max_v in company_max_vehicles.items() if max_v > 2}
+        if special_limits:
+            logger.info("动态公司车数限制（部分）=%s", special_limits)
 
-        x = {}
-        y = {}
-        z = {}
+        original_boxes = all_sub_containers.copy()
 
-        for i in box_ids:
-            vars_in_row = []
-            for j in sc_ids:
-                x[i, j] = solver.IntVar(0, 1, "")
-                vars_in_row.append(x[i, j])
-            solver.Add(sum(vars_in_row) == 1)
+        def create_merged_box(box_list: List[SubContainer]) -> SubContainer:
+            first = box_list[0]
+            if first.box_type.startswith("Person_Box"):
+                merged = SubContainer(first.box_type, 0.0, 0.0, first.max_capacity, first.capacity_type)
+            elif first.box_type == "Equip_Box_Small":
+                merged = SubContainer(
+                    first.box_type,
+                    0.0,
+                    0.0,
+                    first.max_capacity,
+                    first.capacity_type,
+                    category=first.equip_category,
+                )
+            else:
+                raise ValueError(f"不支持合并的箱子类型: {first.box_type}")
+            merged.length_unit = sum(b.length_unit for b in box_list)
+            merged.weight = sum(b.weight for b in box_list)
+            merged.owners = first.owners.copy()
+            merged.contents = []
+            for b in box_list:
+                merged.contents.extend(b.contents)
+            return merged
 
-        for j in sc_ids:
-            y[j] = solver.IntVar(0, 1, "")
-            for i in box_ids:
-                solver.Add(x[i, j] <= y[j])
+        def can_merge(box_list: List[SubContainer]) -> bool:
+            total_len = sum(b.length_unit for b in box_list)
+            total_weight = sum(b.weight for b in box_list)
+            return total_len <= max_length_per_sc + 1e-6 and total_weight <= max_weight_per_sc + 1e-6
 
-            solver.Add(sum(x[i, j] * all_sub_containers[i].weight for i in box_ids) <= sc_limit["maxWeightLimit"] * y[j])
-            solver.Add(sum(x[i, j] * all_sub_containers[i].length_unit for i in box_ids) <= sc_limit["maxLengthLimit"] * y[j])
+        group_dict: Dict[Any, List[int]] = defaultdict(list)
+        for idx, box in enumerate(original_boxes):
+            if box.is_mixed:
+                group_dict[("mixed", idx)].append(idx)
+            else:
+                cid = list(box.owners)[0]
+                cat = getattr(box, "equip_category", None)
+                if box.box_type == "Equip_Box_Large":
+                    group_dict[("large", idx)].append(idx)
+                else:
+                    group_dict[(cid, box.box_type, cat)].append(idx)
 
-        for c_idx in comp_ids:
-            cid = companies[c_idx]["organizationID"]
-            my_boxes = [i for i, b in enumerate(all_sub_containers) if cid in b.owners]
+        merged_boxes: List[SubContainer] = []
+        merge_map: List[List[int]] = []
 
-            sc_usage = []
-            for j in sc_ids:
-                z[c_idx, j] = solver.IntVar(0, 1, "")
-                if my_boxes:
-                    solver.Add(sum(x[i, j] for i in my_boxes) <= 1000 * z[c_idx, j])
-                sc_usage.append(z[c_idx, j])
+        for key, indices in group_dict.items():
+            if key[0] in ("mixed", "large"):
+                for idx in indices:
+                    merged_boxes.append(original_boxes[idx])
+                    merge_map.append([idx])
+                continue
 
-            solver.Add(sum(sc_usage) <= 2)
+            current_group: List[SubContainer] = []
+            for idx in indices:
+                current_box = original_boxes[idx]
+                if current_group and can_merge(current_group + [current_box]):
+                    current_group.append(current_box)
+                else:
+                    if current_group:
+                        merged_box = create_merged_box(current_group)
+                        merged_boxes.append(merged_box)
+                        merge_map.append([original_boxes.index(b) for b in current_group])
+                    current_group = [current_box]
+            if current_group:
+                merged_box = create_merged_box(current_group)
+                merged_boxes.append(merged_box)
+                merge_map.append([original_boxes.index(b) for b in current_group])
 
-        for j in range(len(sc_ids) - 1):
-            solver.Add(y[j] >= y[j + 1])
+        logger.info("启发式预合并完成，合并后箱子总数=%s（原始=%s）", len(merged_boxes), len(original_boxes))
 
-        solver.Minimize(sum(y[j] for j in sc_ids))
-        solver.set_time_limit(300000)
-        logger.info("算法开始求解，箱体数=%s，预计车次数=%s", len(all_sub_containers), est_bins)
-        status = solver.Solve()
+        all_sub_containers = merged_boxes
+        sorted_indices = sorted(range(len(all_sub_containers)), key=lambda i: all_sub_containers[i].length_unit, reverse=True)
 
-        if status not in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
-            return {"code": 1, "msg": "计算无有效解"}
+        heuristic_assign = [-1] * len(all_sub_containers)
+        vehicle_weight: List[float] = []
+        vehicle_length: List[float] = []
+        company_used_vehicles: Dict[str, set] = defaultdict(set)
+        next_vehicle = 0
+
+        t0 = time.time()
+        logger.info("启发式开始装车，箱体数=%s", len(all_sub_containers))
+
+        for idx in sorted_indices:
+            box = all_sub_containers[idx]
+            owners = box.owners
+            placed = False
+
+            for v in range(next_vehicle):
+                if vehicle_weight[v] + box.weight > max_weight_per_sc + 1e-6:
+                    continue
+                if vehicle_length[v] + box.length_unit > max_length_per_sc + 1e-6:
+                    continue
+
+                can_place = True
+                for cid in owners:
+                    if v not in company_used_vehicles[cid]:
+                        if len(company_used_vehicles[cid]) + 1 > company_max_vehicles.get(cid, 2):
+                            can_place = False
+                            break
+                if not can_place:
+                    continue
+
+                vehicle_weight[v] += box.weight
+                vehicle_length[v] += box.length_unit
+                heuristic_assign[idx] = v
+                for cid in owners:
+                    company_used_vehicles[cid].add(v)
+                placed = True
+                break
+
+            if not placed:
+                v = next_vehicle
+                next_vehicle += 1
+                vehicle_weight.append(box.weight)
+                vehicle_length.append(box.length_unit)
+                heuristic_assign[idx] = v
+                for cid in owners:
+                    company_used_vehicles[cid].add(v)
+
+        total_sc_used = next_vehicle
+        logger.info("启发式装车完成，使用 SC 总数=%s，耗时=%.1f秒", total_sc_used, time.time() - t0)
 
         res_data: Dict[str, Any] = {
             "code": 0,
             "msg": "success",
             "data": {
-                "total_SC_used": int(_get_objective_value(solver)),
+                "total_SC_used": total_sc_used,
                 "SC_list": [],
             },
         }
 
-        for j in sc_ids:
-            if y[j].solution_value() > 0.5:
-                sc_info: Dict[str, Any] = {
-                    "SC_ID": f"SC_{j + 1:03d}",
-                    "summary": {},
-                    "box_list": [],
-                }
+        for v in range(total_sc_used):
+            sc_info: Dict[str, Any] = {
+                "SC_ID": f"SC_{v + 1:03d}",
+                "summary": {},
+                "box_list": [],
+            }
 
-                owners_set = set()
-                curr_w = 0.0
-                curr_l = 0.0
-                has_mixed = False
+            owners_set = set()
+            curr_w = 0.0
+            curr_l = 0.0
+            has_mixed = False
 
-                for i in box_ids:
-                    if x[i, j].solution_value() > 0.5:
-                        box = all_sub_containers[i]
-                        owners_set.update(box.owners)
-                        curr_w += box.weight
-                        curr_l += box.length_unit
-                        if box.is_mixed:
-                            has_mixed = True
+            merged_indices = [i for i, assign in enumerate(heuristic_assign) if assign == v]
+            for i in merged_indices:
+                for orig_idx in merge_map[i]:
+                    orig_box = original_boxes[orig_idx]
+                    owners_set.update(orig_box.owners)
+                    curr_w += orig_box.weight
+                    curr_l += orig_box.length_unit
+                    if orig_box.is_mixed:
+                        has_mixed = True
 
-                        box_dict: Dict[str, Any] = {
-                            "box_id": f"Box_{i + 1:04d}",
-                            "box_type": box.box_type,
-                            "is_mixed": box.is_mixed,
-                            "owners": list(box.owners),
-                            "content_desc": build_entities(box),
-                            "weight": round(box.weight, 1),
-                            "length_unit": round(box.length_unit, 2),
-                        }
+                    box_dict: Dict[str, Any] = {
+                        "box_id": f"Box_{orig_idx + 1:04d}",
+                        "box_type": orig_box.box_type,
+                        "is_mixed": orig_box.is_mixed,
+                        "owners": list(orig_box.owners),
+                        "content_desc": build_entities(orig_box),
+                        "weight": round(orig_box.weight, 1),
+                        "length_unit": round(orig_box.length_unit, 2),
+                    }
 
-                        if box.box_type == "Equip_Box_Small":
-                            box_dict["category"] = getattr(box, "equip_category", "未分类")
+                    if orig_box.box_type == "Equip_Box_Small":
+                        box_dict["category"] = getattr(orig_box, "equip_category", "未分类")
 
-                        sc_info["box_list"].append(box_dict)
+                    sc_info["box_list"].append(box_dict)
 
-                owner_list = sorted(owners_set)
-                sc_info["summary"] = {
-                    "companies_included": owner_list,
-                    "total_weight": round(curr_w, 1),
-                    "total_length_unit": round(curr_l, 2),
-                    "has_mixed_box": has_mixed,
-                    "description": f"包含 {len(owner_list)} 个公司: {','.join(owner_list[:3])}... 共 {len(sc_info['box_list'])} 个小箱",
-                }
+            owner_list = list(owners_set)
+            sc_info["summary"] = {
+                "companies_included": owner_list,
+                "total_weight": round(curr_w, 1),
+                "total_length_unit": round(curr_l, 2),
+                "has_mixed_box": has_mixed,
+                "description": f"包含 {len(owner_list)} 个公司: {','.join(owner_list[:3])}... 共 {len(sc_info['box_list'])} 个小箱",
+            }
 
-                res_data["data"]["SC_list"].append(sc_info)
+            res_data["data"]["SC_list"].append(sc_info)
 
         return res_data
     except AlgorithmError as exc:
@@ -558,8 +643,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         logger.exception("算法执行失败")
         return {"code": 1, "msg": "算法执行失败，请查看日志"}
 
+
 # ========================== FastAPI ==========================
 ALGO_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_ALGO_WORKERS, thread_name_prefix="algo-worker")
+ALGO_GATE = threading.BoundedSemaphore(MAX_ALGO_WORKERS)
 atexit.register(ALGO_EXECUTOR.shutdown, wait=False, cancel_futures=False)
 
 
@@ -590,20 +677,52 @@ async def health() -> Dict[str, Any]:
 
 
 @app.post("/api/v1/optimize")
-async def optimize(req: OptimizationRequest):
+async def optimize(req: OptimizationRequest, request: Request):
+    request_id = uuid4().hex[:8]
+    client_host = request.client.host if request.client else "unknown"
+    logger.info("[%s] 收到计算请求，来源=%s", request_id, client_host)
+
     try:
         payload = model_to_payload(req)
-        loop = asyncio.get_running_loop()
-        task = partial(run_engine, payload)
-        result = await loop.run_in_executor(ALGO_EXECUTOR, task)
-        if result.get("code") != 0:
-            raise HTTPException(status_code=400, detail=result.get("msg", "算法执行失败"))
-        return result
+    except Exception as exc:
+        logger.warning("[%s] 请求格式转换失败: %s", request_id, exc)
+        raise HTTPException(status_code=400, detail=f"请求格式错误: {exc}")
+
+    if not ALGO_GATE.acquire(blocking=False):
+        logger.warning("[%s] worker 全部繁忙，拒绝请求", request_id)
+        raise HTTPException(status_code=503, detail="服务繁忙，当前已有计算任务正在执行，请稍后重试")
+
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(ALGO_EXECUTOR, partial(run_engine, payload))
+
+    gate_released = False
+
+    def _release_gate(_):
+        nonlocal gate_released
+        if not gate_released:
+            gate_released = True
+            ALGO_GATE.release()
+            logger.info("[%s] worker 名额已释放", request_id)
+
+    future.add_done_callback(_release_gate)
+
+    try:
+        result = await asyncio.wait_for(asyncio.shield(future), timeout=REQUEST_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.error("[%s] 接口层超时兜底触发，启发式任务仍可能继续执行", request_id)
+        raise HTTPException(status_code=504, detail="计算超时，请检查输入数据规模或联系技术人员")
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("接口调用失败")
+        logger.exception("[%s] 接口调用失败", request_id)
         raise HTTPException(status_code=500, detail=f"接口处理失败: {exc}")
+
+    if result.get("code") != 0:
+        logger.warning("[%s] 算法返回失败: %s", request_id, result.get("msg"))
+        raise HTTPException(status_code=400, detail=result.get("msg", "算法执行失败"))
+
+    logger.info("[%s] 请求完成，返回结果", request_id)
+    return result
 
 
 # ========================== 网络/启动辅助 ==========================
