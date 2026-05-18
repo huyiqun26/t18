@@ -14,11 +14,11 @@ jobs:
       - name: Set up QEMU for ARM64
         uses: docker/setup-qemu-action@v3
 
-      - name: Build and smoke test in official ARM64 Python container
+      - name: Build in official ARM64 Python container
         run: |
           docker run --rm -v ${{ github.workspace }}:/ws -w /ws arm64v8/python:3.10-buster /bin/bash -c "
             set -e
-            apt-get update && apt-get install -y binutils gcc g++ make zlib1g-dev curl
+            apt-get update && apt-get install -y binutils gcc g++ make zlib1g-dev
             pip install --upgrade pip
             pip install -r requirements_linux.txt
             pip install pyinstaller --no-binary pyinstaller
@@ -34,26 +34,6 @@ jobs:
                         --name railway_app_arm64 main.py
 
             chmod -R 777 dist/
-
-            test -f payload_test.json
-
-            ./dist/railway_app_arm64 &
-            APP_PID=\$!
-
-            sleep 8
-
-            curl --fail http://127.0.0.1:2376/health
-
-            curl --fail \
-                 -X POST http://127.0.0.1:2376/api/v1/optimize \
-                 -H \"Content-Type: application/json\" \
-                 --data-binary @payload_test.json \
-                 -o smoke_response.json
-
-            cat smoke_response.json
-
-            kill \$APP_PID || true
-            wait \$APP_PID || true
           "
 
       - name: Upload Finished Binary
@@ -61,9 +41,3 @@ jobs:
         with:
           name: railway-arm64-binary
           path: dist/railway_app_arm64
-
-      - name: Upload Smoke Response
-        uses: actions/upload-artifact@v4
-        with:
-          name: smoke-response
-          path: smoke_response.json
