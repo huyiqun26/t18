@@ -35,6 +35,21 @@ MAX_ALGO_WORKERS = 4
 REQUEST_TIMEOUT_SECONDS = 45.0
 
 
+# 车辆换长均衡参数：只作为启发式目标，不替代任何硬约束。
+# 例如最大换长45时，目标尽量避免出现26左右的低利用车辆。
+BALANCE_MIN_LENGTH_RATIO = 0.78
+BALANCE_TARGET_LENGTH_RATIO = 0.88
+BALANCE_MAX_GAP_RATIO = 0.22
+BALANCE_MAX_ITERATIONS = 500
+
+# 公司人员分布均衡参数：只作为软目标。
+# 若某公司被分到多辆车，尽量让各车上的该公司人数接近；
+# 但不为追求人数均衡破坏人-物同车、超重、超换长、yingjiName等硬约束。
+PERSON_BALANCE_MAX_RATIO = 0.30
+PERSON_BALANCE_MAX_ABS_GAP = 8
+PERSON_BALANCE_WEIGHT = 0.45
+
+
 def get_app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -152,7 +167,6 @@ def model_to_payload(model):
         return dumper()
 
     raise TypeError(f"不支持的请求模型类型: {type(model)}")
-
 
 # ========================== 算法核心（公司成组拼车 + 同SC内物资混装） ==========================
 class SubContainer:
@@ -1735,7 +1749,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
                 last_error = None
 
-                def build_with_target_count(target_count):
+                def build_with_target_count(target_count, non_person_order=None, person_order=None):
                     """
                     构造指定数量的人-物混合装车单元。
 
@@ -1746,8 +1760,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     """
                     chunks = [make_empty_chunk() for _ in range(target_count)]
 
-                    remaining_non_person = list(base_ordered_non_person)
-                    remaining_person = list(base_ordered_person)
+                    remaining_non_person = list(non_person_order if non_person_order is not None else base_ordered_non_person)
+                    remaining_person = list(person_order if person_order is not None else base_ordered_person)
 
                     total_person_l = sum(all_sub_containers[i].length_unit for i in person_indices)
                     total_person_w = sum(all_sub_containers[i].weight for i in person_indices)
@@ -2008,12 +2022,86 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         return None, str(exc)
                     return chunks, ''
 
-                # 从理论下界开始尝试；如果为了满足人-物同车需要增加车辆数，则逐步增加。
+                def order_variants():
+                    """给同一target_count提供多种排序重试，避免50这类边界换长下被单一路径卡死。"""
+                    variants = []
+
+                    def add_variant(name, np_order, p_order):
+                        sig = (tuple(np_order), tuple(p_order))
+                        if any(v[0] == sig for v in variants):
+                            return
+                        variants.append((sig, name, list(np_order), list(p_order)))
+
+                    add_variant('dominant_desc/person_desc', base_ordered_non_person, base_ordered_person)
+                    add_variant(
+                        'length_desc/person_asc',
+                        sorted(base_ordered_non_person, key=lambda i: (box_has_chaoxian_equipment(all_sub_containers[i]), all_sub_containers[i].length_unit, all_sub_containers[i].weight), reverse=True),
+                        sorted(base_ordered_person, key=lambda i: (all_sub_containers[i].length_unit, all_sub_containers[i].weight)),
+                    )
+                    add_variant(
+                        'length_asc/person_desc',
+                        sorted(base_ordered_non_person, key=lambda i: (box_has_chaoxian_equipment(all_sub_containers[i]), all_sub_containers[i].length_unit, all_sub_containers[i].weight)),
+                        base_ordered_person,
+                    )
+                    add_variant(
+                        'weight_desc/person_asc',
+                        sorted(base_ordered_non_person, key=lambda i: (box_has_chaoxian_equipment(all_sub_containers[i]), all_sub_containers[i].weight, all_sub_containers[i].length_unit), reverse=True),
+                        sorted(base_ordered_person, key=lambda i: (all_sub_containers[i].weight, all_sub_containers[i].length_unit)),
+                    )
+                    return [(name, np_order, p_order) for _sig, name, np_order, p_order in variants]
+
+                def chunks_balance_score(chunks):
+                    """公司内部候选块评分：优先可行，其次换长更均衡；必要时允许多拆一块。"""
+                    if not chunks:
+                        return float('inf')
+                    lengths = [c['length'] for c in chunks]
+                    weights = [c['weight'] for c in chunks]
+                    target_l = max_length_per_sc * BALANCE_TARGET_LENGTH_RATIO
+                    min_target_l = max_length_per_sc * BALANCE_MIN_LENGTH_RATIO
+                    under_penalty = sum(max(0.0, min_target_l - l) ** 2 for l in lengths)
+                    target_gap = sum((l - target_l) ** 2 for l in lengths) / max(1, len(lengths))
+                    range_penalty = (max(lengths) - min(lengths)) ** 2 if len(lengths) > 1 else 0.0
+                    weight_range = (max(weights) - min(weights)) ** 2 / max(max_weight_per_sc, 1.0) if len(weights) > 1 else 0.0
+                    extra_count_penalty = 0.35 * max(0, len(chunks) - lower_count) * (max_length_per_sc ** 2)
+                    return 2.20 * under_penalty + 0.85 * target_gap + 0.55 * range_penalty + 0.05 * weight_range + extra_count_penalty
+
+                best_chunks = None
+                best_score = None
+                best_target_count = None
+                best_strategy = ''
+
+                # 从理论下界开始尝试；如果为了满足人-物同车或均衡需要增加车辆数，则逐步增加。
+                # 不再遇到第一个可行方案就返回，避免45/55可行而50被局部贪心误判，
+                # 同时避免公司内部产生40、26这类明显不均衡的块。
                 for target_count in range(lower_count, max_mixed_count + 1):
-                    chunks, err = build_with_target_count(target_count)
-                    if chunks is not None:
-                        return chunks
-                    last_error = err
+                    for strategy_name, np_order, p_order in order_variants():
+                        chunks, err = build_with_target_count(target_count, np_order, p_order)
+                        if chunks is not None:
+                            score = chunks_balance_score(chunks)
+                            if best_score is None or score < best_score:
+                                best_score = score
+                                best_chunks = chunks
+                                best_target_count = target_count
+                                best_strategy = strategy_name
+                        else:
+                            last_error = err
+
+                    # 若已经达到最低车辆数且所有块换长均不低于目标下限，可提前结束；
+                    # 否则继续看多一个混合块是否能显著改善均衡。
+                    if best_chunks is not None and best_target_count == lower_count:
+                        min_l = min(c['length'] for c in best_chunks)
+                        max_l = max(c['length'] for c in best_chunks)
+                        if (min_l >= max_length_per_sc * BALANCE_MIN_LENGTH_RATIO - 1e-6 and
+                                max_l - min_l <= max_length_per_sc * BALANCE_MAX_GAP_RATIO + 1e-6):
+                            break
+
+                if best_chunks is not None:
+                    print(
+                        f"公司 {company_name.get(cid, cid)}({cid}) 人-物同车打包完成："
+                        f"target_count={best_target_count}, strategy={best_strategy}, "
+                        f"换长={[round(c['length'], 2) for c in best_chunks]}"
+                    )
+                    return best_chunks
 
                 raise AlgorithmError(
                     f'公司 {company_name.get(cid, cid)}({cid}) 同时存在人员和物资/装备，'
@@ -2050,9 +2138,26 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         print(f"装车单元数: {len(units)} (优先按公司整体成组；超限公司自动拆分)")
 
         def vehicle_score_after_place(vehicle, unit):
-            fill_w = (vehicle.weight + unit['weight']) / max_weight_per_sc
-            fill_l = (vehicle.length + unit['length']) / max_length_per_sc
-            return 0.75 * max(fill_w, fill_l) + 0.25 * min(fill_w, fill_l) - 0.10 * abs(fill_w - fill_l)
+            """车辆选择评分。
+
+            原逻辑主要追求装得更满，容易在边界换长下形成一辆40左右、另一辆26左右的尾车。
+            现在改为：在不增加硬约束的前提下，优先让放置后的换长接近目标利用率，
+            同时保留重量利用率和同公司/超限加分。
+            """
+            fill_w = (vehicle.weight + unit['weight']) / max_weight_per_sc if max_weight_per_sc else 0.0
+            fill_l = (vehicle.length + unit['length']) / max_length_per_sc if max_length_per_sc else 0.0
+            target_l = BALANCE_TARGET_LENGTH_RATIO
+            min_l = BALANCE_MIN_LENGTH_RATIO
+            under = max(0.0, min_l - fill_l)
+            over = max(0.0, fill_l - 0.98)
+            return (
+                1.10 * fill_l
+                + 0.25 * fill_w
+                - 1.35 * abs(fill_l - target_l)
+                - 0.85 * under
+                - 0.60 * over
+                - 0.10 * abs(fill_w - fill_l)
+            )
 
         def find_best_vehicle(vehicles, unit, exclude_index=None):
             best_v = None
@@ -2128,9 +2233,364 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         vehicles = snapshot
             return vehicles
 
+        def companies_requiring_person_nonperson_mix():
+            presence = defaultdict(lambda: {'person': False, 'non_person': False})
+            for box in all_sub_containers:
+                public_type = get_public_box_type(getattr(box, 'box_type', ''))
+                for cid0 in getattr(box, 'owners', set()):
+                    if public_type == 'Person':
+                        presence[cid0]['person'] = True
+                    else:
+                        presence[cid0]['non_person'] = True
+            return {cid0 for cid0, flags in presence.items() if flags.get('person') and flags.get('non_person')}
+
+        companies_need_mixed_final = companies_requiring_person_nonperson_mix()
+
+        def vehicle_respects_person_nonperson_rule(vehicle):
+            """搬移预检：任何涉及人-物同车硬规则的公司，在单车内不得只出现一种类型。"""
+            per_company = defaultdict(lambda: {'person': False, 'non_person': False})
+            for unit in vehicle.units:
+                for idx0 in unit['box_indices']:
+                    box = all_sub_containers[idx0]
+                    public_type = get_public_box_type(getattr(box, 'box_type', ''))
+                    for cid0 in getattr(box, 'owners', set()):
+                        if public_type == 'Person':
+                            per_company[cid0]['person'] = True
+                        else:
+                            per_company[cid0]['non_person'] = True
+            for cid0, flags in per_company.items():
+                if cid0 in companies_need_mixed_final and flags.get('person') != flags.get('non_person'):
+                    return False
+            return True
+
+        def unit_has_person_box(unit):
+            return any(
+                get_public_box_type(all_sub_containers[bi].box_type) == 'Person'
+                for bi in unit.get('box_indices', [])
+            )
+
+        def unit_has_non_person_box(unit):
+            return any(
+                get_public_box_type(all_sub_containers[bi].box_type) != 'Person'
+                for bi in unit.get('box_indices', [])
+            )
+
+        def box_person_count_for_company(box, cid0):
+            if get_public_box_type(getattr(box, 'box_type', '')) != 'Person':
+                return 0
+            total = 0
+            for item in getattr(box, 'contents', []):
+                if item.get('type') == 'person' and item.get('company_id', '') == cid0:
+                    total += safe_int(item.get('count'), 0)
+            return total
+
+        def unit_person_count_for_company(unit, cid0):
+            return sum(
+                box_person_count_for_company(all_sub_containers[bi], cid0)
+                for bi in unit.get('box_indices', [])
+            )
+
+        def vehicle_person_count_for_company(vehicle, cid0):
+            return sum(unit_person_count_for_company(unit, cid0) for unit in vehicle.units)
+
+        def vehicle_has_company(vehicle, cid0):
+            for unit in vehicle.units:
+                if cid0 in unit.get('owners', set()):
+                    return True
+            return False
+
+        def company_people_distribution_penalty(vehicle_list):
+            """同一公司人员在其所在车辆上的均衡软惩罚。
+
+            只统计人员数量，不改变硬规则；公司只出现在一辆车时惩罚为0。
+            使用相对差距，避免大公司天然因人数多而被过度惩罚。
+            """
+            company_to_vehicle_counts = defaultdict(list)
+            for cid0 in company_name.keys():
+                counts = []
+                for vehicle in vehicle_list:
+                    if vehicle_has_company(vehicle, cid0):
+                        counts.append(vehicle_person_count_for_company(vehicle, cid0))
+                if len(counts) > 1 and sum(counts) > 0:
+                    company_to_vehicle_counts[cid0] = counts
+
+            penalty = 0.0
+            for cid0, counts in company_to_vehicle_counts.items():
+                avg = sum(counts) / len(counts)
+                if avg <= 1e-9:
+                    continue
+                rel_var = sum(((c - avg) / avg) ** 2 for c in counts) / len(counts)
+                allowed_gap = max(PERSON_BALANCE_MAX_ABS_GAP, avg * PERSON_BALANCE_MAX_RATIO)
+                range_over = max(0.0, max(counts) - min(counts) - allowed_gap) / max(avg, 1.0)
+                penalty += rel_var + 1.50 * (range_over ** 2)
+            return penalty
+
+        def overall_balance_objective(vehicle_list):
+            return fleet_balance_objective(vehicle_list) + PERSON_BALANCE_WEIGHT * (max_length_per_sc ** 2) * company_people_distribution_penalty(vehicle_list)
+
+        def fleet_balance_objective(vehicle_list):
+            if not vehicle_list:
+                return 0.0
+            lengths = [v.length for v in vehicle_list if v.units]
+            weights = [v.weight for v in vehicle_list if v.units]
+            if not lengths:
+                return 0.0
+            target_l = max_length_per_sc * BALANCE_TARGET_LENGTH_RATIO
+            min_target_l = max_length_per_sc * BALANCE_MIN_LENGTH_RATIO
+            allowed_gap = max_length_per_sc * BALANCE_MAX_GAP_RATIO
+            under_penalty = sum(max(0.0, min_target_l - l) ** 2 for l in lengths)
+            target_penalty = sum((l - target_l) ** 2 for l in lengths) / max(1, len(lengths))
+            range_penalty = max(0.0, (max(lengths) - min(lengths)) - allowed_gap) ** 2
+            full_range_penalty = (max(lengths) - min(lengths)) ** 2 if len(lengths) > 1 else 0.0
+            weight_range_penalty = (max(weights) - min(weights)) ** 2 / max(max_weight_per_sc, 1.0) if len(weights) > 1 else 0.0
+            return 3.50 * under_penalty + 0.90 * target_penalty + 1.35 * range_penalty + 0.25 * full_range_penalty + 0.04 * weight_range_penalty
+
+        def clone_vehicle_list(vehicle_list):
+            return [v.clone() for v in vehicle_list if v.units]
+
+        def balance_vehicles_by_unit_moves(vehicle_list):
+            """车辆层换长均衡后处理。
+
+            策略顺序：
+            1）优先从同公司已经同车或可同车的装车单元中，搬到换长偏低车辆；
+            2）若同公司没有可行搬移，再允许其他公司“非人员箱”混入低换长车辆；
+            3）跨公司补车时严禁搬入其他公司人员箱；
+            4）每次搬移前后都校验超重、超换长、yingjiName种类数和人-物同车硬规则。
+            """
+            vehicles_local = [v for v in vehicle_list if v.units]
+            if len(vehicles_local) <= 1:
+                return vehicles_local
+
+            def valid_after_move(candidate):
+                return all(v.units and vehicle_respects_person_nonperson_rule(v) for v in candidate)
+
+            current_score = overall_balance_objective(vehicles_local)
+            for _ in range(BALANCE_MAX_ITERATIONS):
+                best = None
+                best_score = current_score
+                under_order = sorted(
+                    range(len(vehicles_local)),
+                    key=lambda i: (vehicles_local[i].length, vehicles_local[i].weight),
+                )
+
+                for receiver_idx in under_order:
+                    receiver = vehicles_local[receiver_idx]
+                    # 低于目标下限，或全局最大/最小换长差距过大时才主动补车。
+                    lengths = [v.length for v in vehicles_local]
+                    need_fill = (
+                        receiver.length < max_length_per_sc * BALANCE_MIN_LENGTH_RATIO - 1e-6
+                        or (max(lengths) - min(lengths)) > max_length_per_sc * BALANCE_MAX_GAP_RATIO + 1e-6
+                    )
+                    if not need_fill:
+                        continue
+
+                    # 两轮候选：先同公司，再其他公司。
+                    for prefer_same_company in (True, False):
+                        for donor_idx, donor in enumerate(vehicles_local):
+                            if donor_idx == receiver_idx or donor.length <= receiver.length + 1e-6:
+                                continue
+                            donor_units = sorted(
+                                list(donor.units),
+                                key=lambda u: (u['length'], u['weight'], u['dominant']),
+                            )
+                            for unit in donor_units:
+                                # 候选搬移粒度：先尝试完整装车单元；若单元过粗，再尝试搬移其中一个原始小箱。
+                                # 小箱级搬移只在最终硬校验仍满足时接受，用于修复40/26这类尾车不均衡。
+                                move_options = [('unit', unit, None)]
+                                if len(unit.get('box_indices', [])) > 1:
+                                    single_boxes = sorted(
+                                        list(unit.get('box_indices', [])),
+                                        key=lambda bi: (
+                                            all_sub_containers[bi].length_unit,
+                                            all_sub_containers[bi].weight,
+                                            get_public_box_type(all_sub_containers[bi].box_type) != 'Person',
+                                        ),
+                                    )
+                                    for bi in single_boxes:
+                                        move_options.append(('single_box', make_unit([bi]), bi))
+
+                                for move_kind, moving_unit, single_box_idx in move_options:
+                                    same_company = bool(moving_unit['owners'] & receiver.companies)
+                                    if prefer_same_company and not same_company:
+                                        continue
+                                    if not prefer_same_company and same_company:
+                                        continue
+                                    # 跨公司补车只允许搬入其他公司的“非人员箱”。
+                                    # 即使完整装车单元里混有人员，也不允许整体搬入；
+                                    # 小箱级搬移时，Person箱同样不允许作为跨公司补车候选。
+                                    if not same_company and unit_has_person_box(moving_unit):
+                                        continue
+                                    if not receiver.can_place(moving_unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
+                                        continue
+                                    # 不把一个本来均衡的供给车拆成新的严重低换长车，除非该车被整体清空。
+                                    donor_after_length = donor.length - moving_unit['length']
+                                    if donor_after_length > 1e-6 and donor_after_length < max_length_per_sc * (BALANCE_MIN_LENGTH_RATIO - 0.08):
+                                        continue
+
+                                    candidate = clone_vehicle_list(vehicles_local)
+                                    cand_unit = None
+                                    for u in candidate[donor_idx].units:
+                                        if u is unit or u == unit:
+                                            cand_unit = u
+                                            break
+                                    if cand_unit is None:
+                                        continue
+
+                                    candidate[donor_idx].remove(cand_unit, company_yingji_name)
+                                    if move_kind == 'unit':
+                                        candidate[receiver_idx].place(cand_unit, company_yingji_name)
+                                    else:
+                                        rest_indices = [bi for bi in cand_unit.get('box_indices', []) if bi != single_box_idx]
+                                        if rest_indices:
+                                            rest_unit = make_unit(rest_indices)
+                                            if not candidate[donor_idx].can_place(rest_unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
+                                                continue
+                                            candidate[donor_idx].place(rest_unit, company_yingji_name)
+                                        candidate[receiver_idx].place(moving_unit, company_yingji_name)
+
+                                    candidate = [v for v in candidate if v.units]
+                                    if not valid_after_move(candidate):
+                                        continue
+                                    new_score = overall_balance_objective(candidate)
+                                    # 同公司搬移稍微放宽接受阈值；其他公司必须明确改善，避免无意义混装。
+                                    improvement_tol = 1e-7 if same_company else 1e-4
+                                    if new_score < best_score - improvement_tol:
+                                        best_score = new_score
+                                        best = candidate
+                        if best is not None:
+                            break
+
+                if best is None:
+                    break
+                vehicles_local = best
+                current_score = best_score
+
+            return vehicles_local
+
+        def balance_company_people_distribution(vehicle_list):
+            """公司人员跨车分布均衡后处理。
+
+            原则：
+            - 只搬同一公司的人员箱，不把其他公司人员拿来补车；
+            - 只在搬移后仍满足人-物同车、超重、超换长、yingjiName种类数等硬规则时接受；
+            - 目标是减少同一公司在其所在车辆上的人数差距，不能保证绝对平均。
+            """
+            vehicles_local = [v for v in vehicle_list if v.units]
+            if len(vehicles_local) <= 1:
+                return vehicles_local
+
+            def valid_after_move(candidate):
+                return all(v.units and vehicle_respects_person_nonperson_rule(v) for v in candidate)
+
+            def company_vehicle_counts(vehicle_list0, cid0):
+                pairs = []
+                for vi, vehicle in enumerate(vehicle_list0):
+                    if vehicle_has_company(vehicle, cid0):
+                        pairs.append((vi, vehicle_person_count_for_company(vehicle, cid0)))
+                return pairs
+
+            def people_gap_needs_fix(counts):
+                if len(counts) <= 1:
+                    return False
+                values = [c for _vi, c in counts]
+                if not values or sum(values) <= 0:
+                    return False
+                avg = sum(values) / len(values)
+                allowed_gap = max(PERSON_BALANCE_MAX_ABS_GAP, avg * PERSON_BALANCE_MAX_RATIO)
+                return (max(values) - min(values)) > allowed_gap + 1e-6
+
+            current_score = overall_balance_objective(vehicles_local)
+            for _ in range(BALANCE_MAX_ITERATIONS):
+                best = None
+                best_score = current_score
+                current_people_penalty = company_people_distribution_penalty(vehicles_local)
+
+                for cid0 in company_name.keys():
+                    counts = company_vehicle_counts(vehicles_local, cid0)
+                    if not people_gap_needs_fix(counts):
+                        continue
+                    avg = sum(c for _vi, c in counts) / len(counts)
+                    high_list = sorted([x for x in counts if x[1] > avg + 1e-6], key=lambda x: x[1], reverse=True)
+                    low_list = sorted([x for x in counts if x[1] < avg - 1e-6], key=lambda x: x[1])
+                    if not high_list or not low_list:
+                        continue
+
+                    for donor_idx, donor_count in high_list:
+                        donor = vehicles_local[donor_idx]
+                        # 只取该公司自己的人员箱作为候选；不移动其他公司人员。
+                        donor_units = sorted(
+                            list(donor.units),
+                            key=lambda u: (unit_person_count_for_company(u, cid0), u['length'], u['weight']),
+                            reverse=True,
+                        )
+                        move_options = []
+                        for unit in donor_units:
+                            person_boxes = [
+                                bi for bi in unit.get('box_indices', [])
+                                if box_person_count_for_company(all_sub_containers[bi], cid0) > 0
+                            ]
+                            # 优先按小箱搬移，避免整单元搬走造成源车人-物同车被破坏。
+                            for bi in sorted(
+                                person_boxes,
+                                key=lambda x: (box_person_count_for_company(all_sub_containers[x], cid0), all_sub_containers[x].length_unit),
+                                reverse=True,
+                            ):
+                                moving_unit = make_unit([bi], forced_owners={cid0})
+                                move_options.append((unit, moving_unit, bi))
+
+                        for receiver_idx, receiver_count in low_list:
+                            if receiver_idx == donor_idx:
+                                continue
+                            receiver = vehicles_local[receiver_idx]
+                            for source_unit, moving_unit, single_box_idx in move_options:
+                                if not receiver.can_place(moving_unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
+                                    continue
+                                # 如果搬移人数明显超过低车缺口，仍允许尝试，但评分会自然惩罚过度搬移。
+                                candidate = clone_vehicle_list(vehicles_local)
+                                cand_source_unit = None
+                                for u in candidate[donor_idx].units:
+                                    if u == source_unit:
+                                        cand_source_unit = u
+                                        break
+                                if cand_source_unit is None:
+                                    continue
+
+                                candidate[donor_idx].remove(cand_source_unit, company_yingji_name)
+                                rest_indices = [bi for bi in cand_source_unit.get('box_indices', []) if bi != single_box_idx]
+                                if rest_indices:
+                                    rest_unit = make_unit(rest_indices)
+                                    if not candidate[donor_idx].can_place(rest_unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
+                                        continue
+                                    candidate[donor_idx].place(rest_unit, company_yingji_name)
+                                candidate[receiver_idx].place(moving_unit, company_yingji_name)
+                                candidate = [v for v in candidate if v.units]
+
+                                if not valid_after_move(candidate):
+                                    continue
+                                new_people_penalty = company_people_distribution_penalty(candidate)
+                                new_score = overall_balance_objective(candidate)
+                                # 人员分布必须确实改善；整体换长均衡不能明显变差。
+                                if new_people_penalty >= current_people_penalty - 1e-9:
+                                    continue
+                                if new_score < best_score - 1e-7:
+                                    best_score = new_score
+                                    best = candidate
+
+                if best is None:
+                    break
+                vehicles_local = best
+                current_score = best_score
+
+            return vehicles_local
+
         vehicles = compact_vehicles(vehicles)
+        vehicles = balance_vehicles_by_unit_moves(vehicles)
+        vehicles = balance_company_people_distribution(vehicles)
         total_sc_used = len(vehicles)
         print(f"启发式装车完成，使用 SC 总数: {total_sc_used}")
+        if vehicles:
+            lengths_after_balance = [round(v.length, 2) for v in vehicles]
+            print(f"车辆换长均衡结果: min={min(lengths_after_balance):.2f}, max={max(lengths_after_balance):.2f}, values={lengths_after_balance}")
 
         heuristic_assign = [-1] * len(all_sub_containers)
         for v, vehicle in enumerate(vehicles):
@@ -2715,7 +3175,6 @@ def build_entities(box, company_yingji_name=None):
         entities = list(merged.values())
 
     return entities
-
 
 atexit.register(ALGO_EXECUTOR.shutdown, wait=False, cancel_futures=False)
 
