@@ -1,20 +1,19 @@
-
 import asyncio
 import atexit
 import logging
 import math
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from logging.handlers import RotatingFileHandler
 import os
-import re
 from pathlib import Path
-from functools import partial
+import re
 import signal
 import socket
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 from uuid import uuid4
 
@@ -1780,18 +1779,120 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         return total_person_w * non_person_share_for_chunk(chunk)
 
                     def can_fit_any_person(chunk, person_list):
-                        for pi in person_list:
-                            if can_add_to_chunk(chunk, pi):
-                                return True
-                        return False
+                        """单块快速预检：至少存在一个可放入的人员箱。"""
+                        return any(can_add_to_chunk(chunk, pi) for pi in person_list)
+
+                    def reserve_distinct_persons(candidate_chunks, person_list):
+                        """为各个未配人员的非人员块分配一个互不重复的人员箱。
+
+                        返回 ``{chunk_index: person_box_index}``；无可行匹配时返回 ``None``。
+                        """
+                        need_chunks = []
+                        for k, chunk0 in enumerate(candidate_chunks):
+                            load0 = chunk_person_nonperson_load(chunk0)
+                            if load0['non_person_count'] > 0 and load0['person_count'] == 0:
+                                need_chunks.append(k)
+                        if len(need_chunks) > len(person_list):
+                            return None
+
+                        # 优先处理可选人员箱更少的块，降低匹配贪心误判概率。
+                        choices = {}
+                        for k in need_chunks:
+                            opts = [pi for pi in person_list if can_add_to_chunk(candidate_chunks[k], pi)]
+                            if not opts:
+                                return None
+                            choices[k] = opts
+                        ordered_chunks = sorted(need_chunks, key=lambda k: len(choices[k]))
+                        person_to_chunk = {}
+
+                        def augment(k, seen):
+                            for pi in choices[k]:
+                                if pi in seen:
+                                    continue
+                                seen.add(pi)
+                                old_k = person_to_chunk.get(pi)
+                                if old_k is None or augment(old_k, seen):
+                                    person_to_chunk[pi] = k
+                                    return True
+                            return False
+
+                        if not all(augment(k, set()) for k in ordered_chunks):
+                            return None
+                        return {k: pi for pi, k in person_to_chunk.items()}
+
+                    def can_reserve_distinct_persons(candidate_chunks, person_list):
+                        """全局预检：每个待配人员块都能预留一个不同的人员箱。"""
+                        return reserve_distinct_persons(candidate_chunks, person_list) is not None
 
                     def can_add_non_person_and_still_fit_person(chunk, np_idx, person_list):
-                        """非人员箱加入后，仍要至少能塞进一个人员箱，否则会制造纯物资单元。"""
+                        """非人员箱加入后，须为各块全局预留互不重复的人员箱。"""
                         if not can_add_to_chunk(chunk, np_idx):
                             return False
                         tmp_indices = list(chunk.get('box_indices', [])) + [np_idx]
                         tmp_chunk = make_unit(tmp_indices, forced_owners={cid})
-                        return can_fit_any_person(tmp_chunk, person_list)
+                        if not can_fit_any_person(tmp_chunk, person_list):
+                            return False
+                        candidate_chunks = list(chunks)
+                        try:
+                            chunk_pos = next(k for k, value in enumerate(chunks) if value is chunk)
+                        except StopIteration:
+                            return False
+                        candidate_chunks[chunk_pos] = tmp_chunk
+                        return can_reserve_distinct_persons(candidate_chunks, person_list)
+
+                    def try_relocate_non_person_for_reservation(chunks, pending_idx, person_list):
+                        """一跳搬移修复非人员箱的贪心死路。
+
+                        当待放箱子无法直接加入任何块时，尝试把一个已放入的非人员箱
+                        搬到别的块，给待放箱子腾出位置；每个候选方案都重新做“不同人员箱”
+                        的全局预留校验。这样 55 换长下不会因为早期均衡策略略有偏差就直接报无解。
+                        """
+                        best_plan = None
+                        best_score = None
+                        for src_k, src in enumerate(chunks):
+                            movable = [
+                                bi for bi in src.get('box_indices', [])
+                                if get_public_box_type(all_sub_containers[bi].box_type) != 'Person'
+                            ]
+                            # 优先搬换长大的箱，通常更容易为 pending_idx 腾出空间。
+                            movable.sort(
+                                key=lambda bi: (all_sub_containers[bi].length_unit, all_sub_containers[bi].weight),
+                                reverse=True,
+                            )
+                            for move_idx in movable:
+                                src_after = [bi for bi in src['box_indices'] if bi != move_idx] + [pending_idx]
+                                new_src = make_unit(src_after, forced_owners={cid})
+                                if (new_src.weight > max_weight_per_sc + 1e-6 or
+                                        new_src.length > max_length_per_sc + 1e-6):
+                                    continue
+                                for dst_k, dst in enumerate(chunks):
+                                    if dst_k == src_k:
+                                        continue
+                                    dst_after = list(dst['box_indices']) + [move_idx]
+                                    new_dst = make_unit(dst_after, forced_owners={cid})
+                                    if (new_dst.weight > max_weight_per_sc + 1e-6 or
+                                            new_dst.length > max_length_per_sc + 1e-6):
+                                        continue
+                                    candidate_chunks = list(chunks)
+                                    candidate_chunks[src_k] = new_src
+                                    candidate_chunks[dst_k] = new_dst
+                                    if not can_reserve_distinct_persons(candidate_chunks, person_list):
+                                        continue
+                                    # 留白越均衡越好，避免刚修复一个箱又堵死后续箱。
+                                    fills = [
+                                        dominant_ratio(c['weight'], c['length'], max_weight_per_sc, max_length_per_sc)
+                                        for c in candidate_chunks
+                                    ]
+                                    score = max(fills) + 0.15 * (max(fills) - min(fills))
+                                    if best_score is None or score < best_score:
+                                        best_score = score
+                                        best_plan = (src_k, dst_k, new_src, new_dst)
+                        if best_plan is None:
+                            return False
+                        src_k, dst_k, new_src, new_dst = best_plan
+                        chunks[src_k] = new_src
+                        chunks[dst_k] = new_dst
+                        return True
 
                     # 第一步：每个目标块先放至少一个物资/装备箱，杜绝纯人员块。
                     # 此时就要预留至少一个人员箱的容量，避免后续出现“物资块已经满了、人员进不去”。
@@ -1846,43 +1947,26 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                 best_score = score
                                 best_k = k
                         if best_k is None:
+                            # 先尝试一跳搬移，修复由前序贪心均衡造成的局部死路；
+                            # 仍失败才说明当前 target_count 下无法继续构造。
+                            if try_relocate_non_person_for_reservation(chunks, idx, remaining_person):
+                                continue
                             return None, f'剩余物资/装备箱 BoxIndex={idx} 无法加入任何可预留人员容量的装车单元'
                         add_box_to_chunk(chunks[best_k], idx)
 
-                    # 第三步：每个目标块放至少一个人员箱，杜绝纯物资/装备块。
-                    # 人员目标不再按“每车平均人数”，而是按该块非人员负载比例分配。
-                    chunk_order = sorted(
-                        range(target_count),
-                        key=lambda kk: target_person_l_for_chunk(chunks[kk]),
+                    # 第三步：按第二步已经验证过的全局匹配，给每个块落入一个不同的人员箱。
+                    # 不能再按局部评分临时抢人箱，否则会破坏前面验证过的可行匹配。
+                    reserved_persons = reserve_distinct_persons(chunks, remaining_person)
+                    if reserved_persons is None:
+                        return None, '物资/装备分摊完成后，无法为每个装车单元匹配不同的人员箱'
+                    for k, idx in sorted(
+                        reserved_persons.items(),
+                        key=lambda pair: target_person_l_for_chunk(chunks[pair[0]]),
                         reverse=True,
-                    )
-                    for k in chunk_order:
-                        best_pos = None
-                        best_score = None
-                        target_l = target_person_l_for_chunk(chunks[k])
-                        target_w = target_person_w_for_chunk(chunks[k])
-                        for pos, idx in enumerate(remaining_person):
-                            if not can_add_to_chunk(chunks[k], idx):
-                                continue
-                            b = all_sub_containers[idx]
-                            load = chunk_person_nonperson_load(chunks[k])
-                            new_person_l = load['person_l'] + b.length_unit
-                            new_person_w = load['person_w'] + b.weight
-                            new_total_l = chunks[k]['length'] + b.length_unit
-                            new_total_w = chunks[k]['weight'] + b.weight
-                            fill_l = new_total_l / max_length_per_sc if max_length_per_sc else 0.0
-                            fill_w = new_total_w / max_weight_per_sc if max_weight_per_sc else 0.0
-                            l_gap = abs(new_person_l - target_l) / max(target_l, 1e-6)
-                            w_gap = abs(new_person_w - target_w) / max(target_w, 1e-6) if target_w > 1e-9 else 0.0
-                            over_l = max(0.0, new_person_l - target_l) / max(target_l, 1e-6)
-                            # 小物资块的目标人员少，优先给它更小的人员箱，避免“一个小物资箱配一堆人”。
-                            score = -1.55 * l_gap - 0.45 * w_gap - 0.85 * over_l - 0.16 * max(fill_l, fill_w) - 0.08 * abs(fill_l - fill_w)
-                            if best_score is None or score > best_score:
-                                best_score = score
-                                best_pos = pos
-                        if best_pos is None:
-                            return None, f'第{k + 1}个装车单元已有物资/装备，但没有任何人员箱能在不超重、不超换长的前提下放入'
-                        idx = remaining_person.pop(best_pos)
+                    ):
+                        if idx not in remaining_person or not can_add_to_chunk(chunks[k], idx):
+                            return None, f'第{k + 1}个装车单元的预留人员箱无法落位'
+                        remaining_person.remove(idx)
                         add_box_to_chunk(chunks[k], idx)
 
                     # 第四步：剩余人员继续按“非人员负载比例”分摊到已有混合块，不能新建纯人员块。
@@ -2634,6 +2718,7 @@ def build_entities(box, company_yingji_name=None):
 
 
 atexit.register(ALGO_EXECUTOR.shutdown, wait=False, cancel_futures=False)
+
 
 def build_cors_origins() -> List[str]:
     raw = os.getenv("RAILWAY_CORS_ALLOW_ORIGINS", "*").strip()
