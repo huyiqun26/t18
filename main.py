@@ -36,18 +36,22 @@ REQUEST_TIMEOUT_SECONDS = 45.0
 
 
 # 车辆换长均衡参数：只作为启发式目标，不替代任何硬约束。
-# 例如最大换长45时，目标尽量避免出现26左右的低利用车辆。
-BALANCE_MIN_LENGTH_RATIO = 0.78
-BALANCE_TARGET_LENGTH_RATIO = 0.88
-BALANCE_MAX_GAP_RATIO = 0.22
-BALANCE_MAX_ITERATIONS = 500
+# 目标：尽可能少用车，并让已使用车辆的换长尽量贴近最大换长，避免出现明显低换长尾车。
+BALANCE_MIN_LENGTH_RATIO = 0.88
+BALANCE_TARGET_LENGTH_RATIO = 0.96
+BALANCE_MAX_GAP_RATIO = 0.10
+BALANCE_MAX_ITERATIONS = 1400
+
+# 公司分散度软惩罚：避免为了补换长把同一公司拆散到过多车辆。
+# 该项只参与候选方案评分，不改变人-物同车、超重、超换长、yingjiName等硬约束。
+COMPANY_SPREAD_WEIGHT = 0.35
 
 # 公司人员分布均衡参数：只作为软目标。
 # 若某公司被分到多辆车，尽量让各车上的该公司人数接近；
 # 但不为追求人数均衡破坏人-物同车、超重、超换长、yingjiName等硬约束。
-PERSON_BALANCE_MAX_RATIO = 0.30
-PERSON_BALANCE_MAX_ABS_GAP = 8
-PERSON_BALANCE_WEIGHT = 0.45
+PERSON_BALANCE_MAX_RATIO = 0.25
+PERSON_BALANCE_MAX_ABS_GAP = 6
+PERSON_BALANCE_WEIGHT = 0.35
 
 
 def get_app_dir() -> Path:
@@ -2325,8 +2329,29 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 penalty += rel_var + 1.50 * (range_over ** 2)
             return penalty
 
+        def company_spread_penalty(vehicle_list):
+            """同一公司被分散到过多车辆的软惩罚。
+
+            说明：
+            - 只统计公司是否出现在某辆车中，不区分人、物资或装备；
+            - 该惩罚不作为硬约束，不会阻止为消除低换长尾车而进行的必要跨公司成组补车；
+            - 目标是在换长接近、车辆数不增加的候选方案之间，优先选择公司分散更少的方案。
+            """
+            penalty = 0.0
+            for cid0 in company_name.keys():
+                vehicle_count = sum(1 for vehicle in vehicle_list if vehicle_has_company(vehicle, cid0))
+                if vehicle_count <= 1:
+                    continue
+                # 轻惩罚“多出现一辆车”，平方项避免过度分散。
+                penalty += (vehicle_count - 1) ** 2
+            return penalty
+
         def overall_balance_objective(vehicle_list):
-            return fleet_balance_objective(vehicle_list) + PERSON_BALANCE_WEIGHT * (max_length_per_sc ** 2) * company_people_distribution_penalty(vehicle_list)
+            return (
+                fleet_balance_objective(vehicle_list)
+                + PERSON_BALANCE_WEIGHT * (max_length_per_sc ** 2) * company_people_distribution_penalty(vehicle_list)
+                + COMPANY_SPREAD_WEIGHT * (max_length_per_sc ** 2) * company_spread_penalty(vehicle_list)
+            )
 
         def fleet_balance_objective(vehicle_list):
             if not vehicle_list:
@@ -2343,7 +2368,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             range_penalty = max(0.0, (max(lengths) - min(lengths)) - allowed_gap) ** 2
             full_range_penalty = (max(lengths) - min(lengths)) ** 2 if len(lengths) > 1 else 0.0
             weight_range_penalty = (max(weights) - min(weights)) ** 2 / max(max_weight_per_sc, 1.0) if len(weights) > 1 else 0.0
-            return 3.50 * under_penalty + 0.90 * target_penalty + 1.35 * range_penalty + 0.25 * full_range_penalty + 0.04 * weight_range_penalty
+            return 7.50 * under_penalty + 1.15 * target_penalty + 2.20 * range_penalty + 0.35 * full_range_penalty + 0.04 * weight_range_penalty
 
         def clone_vehicle_list(vehicle_list):
             return [v.clone() for v in vehicle_list if v.units]
@@ -2352,10 +2377,11 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             """车辆层换长均衡后处理。
 
             策略顺序：
-            1）优先从同公司已经同车或可同车的装车单元中，搬到换长偏低车辆；
-            2）若同公司没有可行搬移，再允许其他公司“非人员箱”混入低换长车辆；
-            3）跨公司补车时严禁搬入其他公司人员箱；
-            4）每次搬移前后都校验超重、超换长、yingjiName种类数和人-物同车硬规则。
+            1）优先从同公司其他车辆中搬完整装车单元或可拆小箱，补到换长偏低车辆；
+            2）同公司补不动时，再尝试从其他公司车辆中拆出可行候选补车；
+            3）跨公司补车若涉及一个同时有人和物的公司，必须搬入完整人-物成组包，不能造成该公司在任一车辆中只有人或只有物；
+            4）评分中加入公司分散度惩罚，避免为了补换长把同一公司分散到过多车辆；
+            5）每次搬移前后都校验超重、超换长、yingjiName种类数和人-物同车硬规则。
             """
             vehicles_local = [v for v in vehicle_list if v.units]
             if len(vehicles_local) <= 1:
@@ -2409,17 +2435,43 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                     for bi in single_boxes:
                                         move_options.append(('single_box', make_unit([bi]), bi))
 
+                                    # 对跨公司补车很关键：如果单独搬一个其他公司的物资/人员箱会破坏
+                                    # “该公司在每辆车中必须人-物同车”的硬规则，则尝试搬一个最小成组包。
+                                    # 成组包通常由同一公司的一个人员箱 + 一个非人员箱组成；
+                                    # 若该公司在该单元中已有多箱，可生成若干候选组合，由后续硬校验筛选。
+                                    bundle_seen = set()
+                                    owners_in_unit = sorted(set(unit.get('owners', set())))
+                                    for owner0 in owners_in_unit:
+                                        if owner0 not in companies_need_mixed_final:
+                                            continue
+                                        person_bis = [
+                                            bi for bi in unit.get('box_indices', [])
+                                            if owner0 in all_sub_containers[bi].owners
+                                            and get_public_box_type(all_sub_containers[bi].box_type) == 'Person'
+                                        ]
+                                        non_person_bis = [
+                                            bi for bi in unit.get('box_indices', [])
+                                            if owner0 in all_sub_containers[bi].owners
+                                            and get_public_box_type(all_sub_containers[bi].box_type) != 'Person'
+                                        ]
+                                        person_bis = sorted(person_bis, key=lambda bi: (all_sub_containers[bi].length_unit, all_sub_containers[bi].weight))[:4]
+                                        non_person_bis = sorted(non_person_bis, key=lambda bi: (all_sub_containers[bi].length_unit, all_sub_containers[bi].weight))[:4]
+                                        for p_bi in person_bis:
+                                            for np_bi in non_person_bis:
+                                                bundle = tuple(sorted({p_bi, np_bi}))
+                                                if len(bundle) < 2 or bundle in bundle_seen:
+                                                    continue
+                                                bundle_seen.add(bundle)
+                                                move_options.append(('mixed_bundle', make_unit(list(bundle), forced_owners={owner0}), None))
+
                                 for move_kind, moving_unit, single_box_idx in move_options:
                                     same_company = bool(moving_unit['owners'] & receiver.companies)
                                     if prefer_same_company and not same_company:
                                         continue
                                     if not prefer_same_company and same_company:
                                         continue
-                                    # 跨公司补车只允许搬入其他公司的“非人员箱”。
-                                    # 即使完整装车单元里混有人员，也不允许整体搬入；
-                                    # 小箱级搬移时，Person箱同样不允许作为跨公司补车候选。
-                                    if not same_company and unit_has_person_box(moving_unit):
-                                        continue
+                                    # 跨公司补车允许搬入其他公司人员箱，但必须与该公司物资/装备成组满足人-物同车。
+                                    # 单独搬入人员箱或单独搬入物资箱若会造成该公司在某车中人物分离，会在 valid_after_move 中被拒绝。
                                     if not receiver.can_place(moving_unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
                                         continue
                                     # 不把一个本来均衡的供给车拆成新的严重低换长车，除非该车被整体清空。
@@ -2440,7 +2492,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                     if move_kind == 'unit':
                                         candidate[receiver_idx].place(cand_unit, company_yingji_name)
                                     else:
-                                        rest_indices = [bi for bi in cand_unit.get('box_indices', []) if bi != single_box_idx]
+                                        moving_indices = set(moving_unit.get('box_indices', []))
+                                        rest_indices = [bi for bi in cand_unit.get('box_indices', []) if bi not in moving_indices]
                                         if rest_indices:
                                             rest_unit = make_unit(rest_indices)
                                             if not candidate[donor_idx].can_place(rest_unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
@@ -2452,8 +2505,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                     if not valid_after_move(candidate):
                                         continue
                                     new_score = overall_balance_objective(candidate)
-                                    # 同公司搬移稍微放宽接受阈值；其他公司必须明确改善，避免无意义混装。
-                                    improvement_tol = 1e-7 if same_company else 1e-4
+                                    # 同公司搬移优先；跨公司搬移必须在补换长/少浪费方面带来更明确收益，且评分会惩罚公司过度分散。
+                                    improvement_tol = 1e-7 if same_company else 5e-4
                                     if new_score < best_score - improvement_tol:
                                         best_score = new_score
                                         best = candidate
@@ -2583,9 +2636,27 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
             return vehicles_local
 
+        # 多轮执行“压缩车辆数 -> 换长均衡 -> 公司人员均衡”。
+        # 先尽量少用车，再在不增加车辆数、不破坏硬约束的前提下把尾车换长补起来。
+        last_signature = None
+        for _balance_round in range(6):
+            vehicles = compact_vehicles(vehicles)
+            vehicles = balance_vehicles_by_unit_moves(vehicles)
+            vehicles = balance_company_people_distribution(vehicles)
+            signature = (
+                len(vehicles),
+                tuple(sorted(round(v.length, 3) for v in vehicles)),
+                tuple(sorted(round(v.weight, 3) for v in vehicles)),
+            )
+            if signature == last_signature:
+                break
+            last_signature = signature
+        # 均衡后再尝试一次压缩；如压缩成功，再做一次均衡，避免新尾车过小。
+        before_count = len(vehicles)
         vehicles = compact_vehicles(vehicles)
-        vehicles = balance_vehicles_by_unit_moves(vehicles)
-        vehicles = balance_company_people_distribution(vehicles)
+        if len(vehicles) < before_count:
+            vehicles = balance_vehicles_by_unit_moves(vehicles)
+            vehicles = balance_company_people_distribution(vehicles)
         total_sc_used = len(vehicles)
         print(f"启发式装车完成，使用 SC 总数: {total_sc_used}")
         if vehicles:
@@ -2674,8 +2745,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
         def repack_large_and_small_boxes_within_sc(sc_boxes):
             """
-            在SC车辆组合已经确定后，对同一SC内的Large装备箱和Small物资箱分别二次重装。
-            - Person固定不动；
+            在SC车辆组合已经确定后，只对同一SC内的Large、Small二次重装。
+            - Person人员箱保持原箱，不做跨公司人员拼箱；
             - Large装备：同一zzsbid内可跨公司尾数拼箱，不检查sbrl/sbzz，只检查zzsbidNumber尾数规则和yingjiName≤2；
             - Small物资：保持原有同一zzsbid内跨公司尾数拼箱、zjdh矩阵、体积/载重、yingjiName≤2规则。
             """
@@ -2684,7 +2755,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             goods_items = []
             for orig_idx, box in sc_boxes:
                 public_type = get_public_box_type(box.box_type)
-                if public_type == 'Large':
+                if public_type == 'Person':
+                    # 明确保留原人员箱，不再把不同公司人员重装到同一个Person箱。
+                    fixed_boxes.append((orig_idx, box))
+                elif public_type == 'Large':
                     for item in getattr(box, 'contents', []):
                         if item.get('type') == 'component':
                             component_items.append(dict(item))
@@ -2869,7 +2943,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 for orig_idx in merge_map[i]:
                     sc_source_boxes.append((orig_idx, original_boxes[orig_idx]))
 
-            # 只有在同一SC内部，才允许不同公司的Large装备/Small物资按各自规则二次重装；Person保持原箱。
+            # 只有在同一SC内部，才允许不同公司的Large/Small按各自规则二次重装；Person人员箱保持原箱，不跨公司拼箱。
             output_boxes = repack_large_and_small_boxes_within_sc(sc_source_boxes)
 
             virtual_counter = 1
@@ -2949,11 +3023,11 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max_length_per_sc, zjdh_forbid_matrix)
         return res_data
     except AlgorithmError as exc:
-        logger.warning("算法输入错误: %s", exc)
-        return {"code": 1, "msg": str(exc)}
-    except Exception:
-        logger.exception("算法执行失败")
-        return {"code": 1, "msg": "算法执行失败，请查看日志"}
+        logger.warning("算法执行失败，具体原因: %s", exc, exc_info=True)
+        return {"code": 1, "msg": f"算法执行失败：{exc}"}
+    except Exception as exc:
+        logger.exception("算法执行失败，具体原因: %s", exc)
+        return {"code": 1, "msg": f"算法执行失败：{exc}，请查看日志"}
 
 
 def validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max_length_per_sc, zjdh_forbid_matrix=None):
