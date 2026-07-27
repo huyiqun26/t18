@@ -3,17 +3,17 @@ import atexit
 import logging
 import math
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 from logging.handlers import RotatingFileHandler
 import os
-from pathlib import Path
 import re
+from pathlib import Path
+from functools import partial
 import signal
 import socket
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 from uuid import uuid4
 
@@ -32,8 +32,6 @@ LOG_FILE_NAME = "railway_service.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 MAX_ALGO_WORKERS = 4
-REQUEST_TIMEOUT_SECONDS = 45.0
-
 
 # 车辆换长均衡参数：只作为启发式目标，不替代任何硬约束。
 # 目标：尽可能少用车，并让已使用车辆的换长尽量贴近最大换长，避免出现明显低换长尾车。
@@ -52,6 +50,7 @@ COMPANY_SPREAD_WEIGHT = 0.35
 PERSON_BALANCE_MAX_RATIO = 0.25
 PERSON_BALANCE_MAX_ABS_GAP = 6
 PERSON_BALANCE_WEIGHT = 0.35
+
 
 
 def get_app_dir() -> Path:
@@ -171,6 +170,7 @@ def model_to_payload(model):
         return dumper()
 
     raise TypeError(f"不支持的请求模型类型: {type(model)}")
+
 
 # ========================== 算法核心（公司成组拼车 + 同SC内物资混装） ==========================
 class SubContainer:
@@ -3250,8 +3250,10 @@ def build_entities(box, company_yingji_name=None):
 
     return entities
 
-atexit.register(ALGO_EXECUTOR.shutdown, wait=False, cancel_futures=False)
 
+# ========================== 服务状态 ==========================
+
+atexit.register(ALGO_EXECUTOR.shutdown, wait=False, cancel_futures=False)
 
 def build_cors_origins() -> List[str]:
     raw = os.getenv("RAILWAY_CORS_ALLOW_ORIGINS", "*").strip()
@@ -3310,10 +3312,9 @@ async def optimize(req: OptimizationRequest, request: Request):
     future.add_done_callback(_release_gate)
 
     try:
-        result = await asyncio.wait_for(asyncio.shield(future), timeout=REQUEST_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        logger.error("[%s] 接口层超时兜底触发，启发式任务仍可能继续执行", request_id)
-        raise HTTPException(status_code=504, detail="计算超时，请检查输入数据规模或联系技术人员")
+        # 不再设置45秒接口等待上限：保持等待，直到算法线程正常结束。
+        # 仅修改接口等待行为，不改变任何装箱、混装、约束、评分或均衡规则。
+        result = await asyncio.shield(future)
     except HTTPException:
         raise
     except Exception as exc:
