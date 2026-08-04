@@ -1,38 +1,44 @@
-
 import asyncio
 import atexit
+import http.client
 import logging
 import math
-from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 import os
 import re
 from pathlib import Path
-from functools import partial
-import signal
 import socket
+import signal
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
-from uuid import uuid4
+from collections import defaultdict
+from typing import Any, Dict, List, Optional
+from functools import partial
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+import uuid
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
-
 # ========================== 基础配置 ==========================
 APP_TITLE = "铁路运输配载服务"
-API_HOST = os.getenv("RAILWAY_API_HOST", "0.0.0.0")
-API_PORT = int(os.getenv("RAILWAY_API_PORT", "2376"))
+API_HOST = "0.0.0.0"
+API_PORT = 2376
+INSTANCE_LOCK_PORT = 23761
 HEALTH_PATH = "/health"
 LOG_FILE_NAME = "railway_service.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
+SERVER_START_TIMEOUT = 20.0
+SERVER_STOP_TIMEOUT = 10.0
+STATUS_POLL_MS = 1000
+SERVER_MONITOR_INTERVAL = 5.0
 MAX_ALGO_WORKERS = 4
+REQUEST_TIMEOUT_SECONDS = None  # 兼容保留：接口已取消固定超时，不参与运行
+BUILD_VERSION = "2026-08-03-linux-v7-capacity-cache"
 
 # 车辆换长均衡参数：只作为启发式目标，不替代任何硬约束。
 # 目标：尽可能少用车，并让已使用车辆的换长尽量贴近最大换长，避免出现明显低换长尾车。
@@ -53,7 +59,6 @@ PERSON_BALANCE_MAX_ABS_GAP = 6
 PERSON_BALANCE_WEIGHT = 0.35
 
 
-
 def get_app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -70,11 +75,10 @@ def ensure_log_dir() -> None:
 
 ensure_log_dir()
 
-logger = logging.getLogger("railway_service_linux")
+logger = logging.getLogger("railway_service")
 logger.setLevel(logging.INFO)
 logger.handlers.clear()
 logger.propagate = False
-
 _file_handler = RotatingFileHandler(
     LOG_PATH,
     maxBytes=LOG_MAX_BYTES,
@@ -107,7 +111,7 @@ class StreamToLogger:
             self.log_obj.log(self.level, line)
         self._buffer = ""
 
-    def isatty(self) -> bool:
+    def isatty(self):
         return False
 
 
@@ -115,7 +119,7 @@ sys.stdout = StreamToLogger(logger, logging.INFO)
 sys.stderr = StreamToLogger(logger, logging.ERROR)
 
 
-def handle_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
+def handle_uncaught_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         return
     logger.exception("未捕获异常", exc_info=(exc_type, exc_value, exc_traceback))
@@ -123,22 +127,12 @@ def handle_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
 
 sys.excepthook = handle_uncaught_exception
 
-
-def _threading_excepthook(args) -> None:
-    logger.exception("线程未捕获异常", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
-
-
 if hasattr(threading, "excepthook"):
+    def _threading_excepthook(args):
+        logger.exception("线程未捕获异常", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
     threading.excepthook = _threading_excepthook
-
-
-def configure_process_signals() -> None:
-    if hasattr(signal, "SIGHUP"):
-        try:
-            signal.signal(signal.SIGHUP, signal.SIG_IGN)
-            logger.info("已忽略 SIGHUP，降低 SSH 断开导致进程退出的概率")
-        except Exception:
-            logger.exception("配置 SIGHUP 忽略失败")
 
 
 # ========================== 数据模型 ==========================
@@ -203,6 +197,11 @@ class SubContainer:
         self.goods_item_counts = defaultdict(int)
         self.goods_item_limits = {}
         self.goods_closed = False
+        # 等价性能缓存：箱内类别/尾数/zjdh摘要，避免每个候选都重新遍历全部contents。
+        self._goods_key_all_tail = {}
+        self._component_key_all_tail = {}
+        self._goods_zjdh_indices = set()
+        self._pack_cache_size = 0
 
     def add_item(self, company_id, item_info, item_weight, item_load_value, item_volume=0.0):
         # 物资/装备特有的装箱逻辑：
@@ -234,6 +233,9 @@ class SubContainer:
                 self.weight += float(item_weight)
                 self.contents.append(item_info)
                 self.owners.add(company_id)
+                old_tail = self._component_key_all_tail.get(item_key, True)
+                self._component_key_all_tail[item_key] = old_tail and bool(item_info.get('_component_tail_candidate', False))
+                self._pack_cache_size = len(self.contents)
                 self.goods_item_counts[item_key] += 1
                 self.goods_item_limits[item_key] = item_limit
                 if self.goods_item_counts[item_key] >= item_limit:
@@ -259,6 +261,12 @@ class SubContainer:
                 self.weight += float(item_weight)
                 self.contents.append(item_info)
                 self.owners.add(company_id)
+                old_tail = self._goods_key_all_tail.get(item_key, True)
+                self._goods_key_all_tail[item_key] = old_tail and bool(item_info.get('_goods_tail_candidate', False))
+                zjdh_idx = _cached_zjdh_index(item_info)
+                if zjdh_idx is not None:
+                    self._goods_zjdh_indices.add(zjdh_idx)
+                self._pack_cache_size = len(self.contents)
                 self.goods_item_counts[item_key] += 1
                 self.goods_item_limits[item_key] = item_limit
                 if self.goods_item_counts[item_key] >= item_limit:
@@ -283,6 +291,20 @@ class SubContainer:
 
 class AlgorithmError(Exception):
     pass
+
+
+class UnitDict(dict):
+    """内部装车单元/块：保持dict全部行为，同时兼容历史分支的属性式读取。"""
+    __slots__ = ()
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name, value):
+        self[name] = value
 
 
 ALGO_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_ALGO_WORKERS, thread_name_prefix="algo-worker")
@@ -686,6 +708,46 @@ def load_zjdh_forbid_matrix(sys_settings=None):
     return DEFAULT_ZJDH_FORBID_MATRIX
 
 
+def _cached_zjdh_index(item):
+    """缓存算法内部物资的zjdh映射；出参校验字典不写入任何内部字段。"""
+    raw = item.get('zjdh')
+    # 只有装箱阶段的内部item带有_goods_item_key；最终content_desc不得被校验过程改写。
+    if '_goods_item_key' not in item:
+        return normalize_zjdh_value(raw)
+    marker = item.get('_zjdh_cache_raw', object())
+    if marker == raw and '_zjdh_cache_index' in item:
+        return item.get('_zjdh_cache_index')
+    idx = normalize_zjdh_value(raw)
+    item['_zjdh_cache_raw'] = raw
+    item['_zjdh_cache_index'] = idx
+    return idx
+
+
+def _ensure_box_pack_cache(box):
+    """兼容contents被合并代码直接扩展的情况：仅在摘要失效时重建一次。"""
+    contents = getattr(box, 'contents', [])
+    if getattr(box, '_pack_cache_size', -1) == len(contents):
+        return
+    goods_key_all_tail = {}
+    component_key_all_tail = {}
+    goods_zjdh_indices = set()
+    for item in contents:
+        item_type = item.get('type')
+        if item_type == 'goods':
+            key = item.get('_goods_item_key') or goods_item_key(item)
+            goods_key_all_tail[key] = goods_key_all_tail.get(key, True) and bool(item.get('_goods_tail_candidate', False))
+            idx = _cached_zjdh_index(item)
+            if idx is not None:
+                goods_zjdh_indices.add(idx)
+        elif item_type == 'component':
+            key = item.get('_component_item_key') or component_item_key(item)
+            component_key_all_tail[key] = component_key_all_tail.get(key, True) and bool(item.get('_component_tail_candidate', False))
+    box._goods_key_all_tail = goods_key_all_tail
+    box._component_key_all_tail = component_key_all_tail
+    box._goods_zjdh_indices = goods_zjdh_indices
+    box._pack_cache_size = len(contents)
+
+
 def can_mix_zjdh(existing_item, new_item, zjdh_forbid_matrix):
     """
     按 zjdh 禁配矩阵判断两件物资是否允许混装。
@@ -695,8 +757,8 @@ def can_mix_zjdh(existing_item, new_item, zjdh_forbid_matrix):
     - 只要任意一件物资未提供 zjdh 字段、zjdh 为空，或 zjdh 值不在映射范围内，就不触发禁配矩阵，直接视为 zjdh 层面允许混装；
     - zjdh 层面允许后，仍继续执行 name+zzsbid、尾数拼箱、体积/载重、yingjiName 等其他规则。
     """
-    old_idx = normalize_zjdh_value(existing_item.get('zjdh'))
-    new_idx = normalize_zjdh_value(new_item.get('zjdh'))
+    old_idx = _cached_zjdh_index(existing_item)
+    new_idx = _cached_zjdh_index(new_item)
 
     # 新规则：缺失、空值、无法识别时，不再保守禁止，而是视为 zjdh 层面允许混装。
     if old_idx is None or new_idx is None:
@@ -725,19 +787,22 @@ def can_pack_goods_item(box, new_item, company_yingji_name, zjdh_forbid_matrix):
     if not can_mix_goods_owner(box, cid, company_yingji_name):
         return False
 
+    _ensure_box_pack_cache(box)
     new_key = new_item.get('_goods_item_key') or goods_item_key(new_item)
     new_is_tail = bool(new_item.get('_goods_tail_candidate', False))
-    for old_item in getattr(box, 'contents', []):
-        if old_item.get('type') != 'goods':
-            continue
-        old_key = old_item.get('_goods_item_key') or goods_item_key(old_item)
-        # 先执行 zjdh 禁配判断；若任一方 zjdh 缺失/空/无法识别，则该层面直接放行，再继续判断同类/尾数拼箱规则。
-        if not can_mix_zjdh(old_item, new_item, zjdh_forbid_matrix):
-            return False
-        if old_key != new_key:
-            old_is_tail = bool(old_item.get('_goods_tail_candidate', False))
-            if not (old_is_tail and new_is_tail):
+
+    # 等价执行原逐件zjdh检查：未知/空值不进入集合；有效行号与新物资逐一按双向矩阵判断。
+    new_idx = _cached_zjdh_index(new_item)
+    if new_idx is not None:
+        mat = zjdh_forbid_matrix if zjdh_forbid_matrix is not None else DEFAULT_ZJDH_FORBID_MATRIX
+        for old_idx in box._goods_zjdh_indices:
+            if mat[old_idx - 1][new_idx - 1] != 0 or mat[new_idx - 1][old_idx - 1] != 0:
                 return False
+
+    # 等价执行原尾数规则：只要存在不同类别，该类别的既有物资与新物资都必须是尾数。
+    for old_key, old_all_tail in box._goods_key_all_tail.items():
+        if old_key != new_key and not (old_all_tail and new_is_tail):
+            return False
     return True
 
 
@@ -782,17 +847,13 @@ def can_pack_component_item(box, new_item, company_yingji_name, zjdh_forbid_matr
     if getattr(box, 'current_load', 0.0) + new_fraction > getattr(box, 'max_capacity', 1.0) + 1e-6:
         return False
 
+    _ensure_box_pack_cache(box)
     new_key = new_item.get('_component_item_key') or component_item_key(new_item)
     new_is_tail = bool(new_item.get('_component_tail_candidate', False))
-    for old_item in getattr(box, 'contents', []):
-        if old_item.get('type') != 'component':
-            continue
-        old_key = old_item.get('_component_item_key') or component_item_key(old_item)
-        # Large装备不走zjdh矩阵；不同component只按 componentname+zzsbid、尾数规则、占用比例和yingjiName判断。
-        if old_key != new_key:
-            old_is_tail = bool(old_item.get('_component_tail_candidate', False))
-            if not (old_is_tail and new_is_tail):
-                return False
+    # Large装备不走zjdh矩阵；等价汇总原逐件 componentname+zzsbid / 尾数判断。
+    for old_key, old_all_tail in box._component_key_all_tail.items():
+        if old_key != new_key and not (old_all_tail and new_is_tail):
+            return False
     return True
 
 
@@ -859,6 +920,12 @@ class VehicleState:
         self.companies = set()
         self.yingji_companies = defaultdict(set)
         self.chaoXian_companies = set()
+        # 等价性能缓存：只记录同一公司/超限公司当前出现在多少个装车单元中。
+        # 不改变任何装车规则、评分或输出，仅避免 remove 时反复扫描整辆车的全部单元。
+        self._company_unit_counts = defaultdict(int)
+        self._chaoxian_unit_counts = defaultdict(int)
+        # 等价性能缓存：车辆内各公司人员数量。只复用已有unit统计，不改变人员分配。
+        self._person_counts = defaultdict(int)
 
     def clone(self):
         other = VehicleState()
@@ -868,6 +935,9 @@ class VehicleState:
         other.companies = set(self.companies)
         other.yingji_companies = defaultdict(set, {g: set(cids) for g, cids in self.yingji_companies.items()})
         other.chaoXian_companies = set(self.chaoXian_companies)
+        other._company_unit_counts = defaultdict(int, self._company_unit_counts)
+        other._chaoxian_unit_counts = defaultdict(int, self._chaoxian_unit_counts)
+        other._person_counts = defaultdict(int, self._person_counts)
         return other
 
     def can_place(self, unit, max_weight, max_length, company_yingji_name):
@@ -892,28 +962,52 @@ class VehicleState:
         self.length += unit['length']
         self.units.append(unit)
         for cid in unit['owners']:
-            self.companies.add(cid)
-            yingji_name = company_yingji_name.get(cid, '')
-            if is_effective_yingji_name(yingji_name):
-                self.yingji_companies[yingji_name].add(cid)
+            self._company_unit_counts[cid] += 1
+            if self._company_unit_counts[cid] == 1:
+                self.companies.add(cid)
+                yingji_name = company_yingji_name.get(cid, '')
+                if is_effective_yingji_name(yingji_name):
+                    self.yingji_companies[yingji_name].add(cid)
         if unit.get('has_chaoXian_equipment'):
-            self.chaoXian_companies.update(unit.get('chaoXian_owners', set()))
+            for cid in unit.get('chaoXian_owners', set()):
+                self._chaoxian_unit_counts[cid] += 1
+                if self._chaoxian_unit_counts[cid] == 1:
+                    self.chaoXian_companies.add(cid)
+        for cid, count in unit.get('_person_counts', {}).items():
+            self._person_counts[cid] += count
 
     def remove(self, unit, company_yingji_name):
         self.weight -= unit['weight']
         self.length -= unit['length']
         self.units.remove(unit)
-        self.companies = set()
-        self.yingji_companies = defaultdict(set)
-        self.chaoXian_companies = set()
-        for u in self.units:
-            for cid in u['owners']:
-                self.companies.add(cid)
-                yingji_name = company_yingji_name.get(cid, '')
-                if is_effective_yingji_name(yingji_name):
-                    self.yingji_companies[yingji_name].add(cid)
-            if u.get('has_chaoXian_equipment'):
-                self.chaoXian_companies.update(u.get('chaoXian_owners', set()))
+        for cid in unit['owners']:
+            remaining = self._company_unit_counts.get(cid, 0) - 1
+            if remaining > 0:
+                self._company_unit_counts[cid] = remaining
+                continue
+            self._company_unit_counts.pop(cid, None)
+            self.companies.discard(cid)
+            yingji_name = company_yingji_name.get(cid, '')
+            if is_effective_yingji_name(yingji_name):
+                cids = self.yingji_companies.get(yingji_name)
+                if cids is not None:
+                    cids.discard(cid)
+                    if not cids:
+                        self.yingji_companies.pop(yingji_name, None)
+        if unit.get('has_chaoXian_equipment'):
+            for cid in unit.get('chaoXian_owners', set()):
+                remaining = self._chaoxian_unit_counts.get(cid, 0) - 1
+                if remaining > 0:
+                    self._chaoxian_unit_counts[cid] = remaining
+                    continue
+                self._chaoxian_unit_counts.pop(cid, None)
+                self.chaoXian_companies.discard(cid)
+        for cid, count in unit.get('_person_counts', {}).items():
+            remaining = self._person_counts.get(cid, 0) - count
+            if remaining:
+                self._person_counts[cid] = remaining
+            else:
+                self._person_counts.pop(cid, None)
 
 
 def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1119,6 +1213,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 if best_box is not None:
                     if not best_box.add_item(cid, item_info, w, occupancy, item_volume=vol):
                         raise AlgorithmError(f'装备 {name or comp_id} 匹配到旧Large箱但装入失败，请检查体积/载重/zzsbidNumber')
+                    # 已闭箱的Large后续必定会被原逻辑跳过，立即移出候选列表只减少无效扫描。
+                    if getattr(best_box, 'goods_closed', False):
+                        open_large_boxes[key].remove(best_box)
                     placed = True
 
                 if not placed:
@@ -1140,7 +1237,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                             f'请检查zzsbidNumber或尾数拼箱规则'
                         )
                     all_sub_containers.append(new_box)
-                    open_large_boxes[key].append(new_box)
+                    # 新箱若单件即满，原逻辑后续只会跳过；不放入开放候选列表。
+                    if not getattr(new_box, 'goods_closed', False):
+                        open_large_boxes[key].append(new_box)
 
             # === 处理物资（按文档新规则：不再按category分装，按zzsbidNumber、体积、载重混装） ===
             goods_list = comp.get('goodsList', []) or []
@@ -1227,6 +1326,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 if best_box is not None:
                     if not best_box.add_item(cid, item_info, w, 0.0, item_volume=tj):
                         raise AlgorithmError(f'物资 {name or gid} 匹配到旧箱但装入失败，请检查体积/载重/zzsbidNumber')
+                    # 已闭箱的Small后续必定会被原逻辑跳过，立即移出候选列表只减少无效扫描。
+                    if getattr(best_box, 'goods_closed', False):
+                        open_small_boxes[key].remove(best_box)
                     placed = True
 
                 if not placed:
@@ -1250,7 +1352,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                             f'zzsbid={zzsbid}, sbzz={new_box.max_payload:.1f}, sbrl={new_box.max_volume:.2f}'
                         )
                     all_sub_containers.append(new_box)
-                    open_small_boxes[key].append(new_box)
+                    # 新箱若单件即满，原逻辑后续只会跳过；不放入开放候选列表。
+                    if not getattr(new_box, 'goods_closed', False):
+                        open_small_boxes[key].append(new_box)
 
         logger.info("预处理完成，生成小车/小箱总数=%s", len(all_sub_containers))
         original_boxes = all_sub_containers.copy()
@@ -1484,6 +1588,19 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         print(f"合并后箱子总数: {len(merged_boxes)} (原始: {len(original_boxes)})")
         all_sub_containers = merged_boxes
 
+        # 等价性能缓存：合并箱在后续车辆搜索阶段内容不再变化，箱型、人员数和超限归属只计算一次。
+        for box in all_sub_containers:
+            public_type = get_public_box_type(getattr(box, 'box_type', ''))
+            person_counts = defaultdict(int)
+            if public_type == 'Person':
+                for item in getattr(box, 'contents', []):
+                    if item.get('type') == 'person':
+                        cid0 = item.get('company_id', '')
+                        person_counts[cid0] += safe_int(item.get('count'), 0)
+            box._cached_public_type = public_type
+            box._cached_person_counts = dict(person_counts)
+            box._cached_chao_owners = box_chaoxian_owners(box)
+
         indices_by_company = defaultdict(list)
         mixed_indices = []
         for idx, box in enumerate(all_sub_containers):
@@ -1500,21 +1617,67 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             total_w = 0.0
             total_l = 0.0
             chao_owners = set()
+            person_owners = set()
+            non_person_owners = set()
+            person_counts = defaultdict(int)
+            has_person_box = False
+            has_non_person_box = False
+            person_w = person_l = non_person_w = non_person_l = 0.0
+            person_box_count = non_person_box_count = 0
             for i in box_indices:
                 b = all_sub_containers[i]
                 owners.update(b.owners)
                 total_w += b.weight
                 total_l += b.length_unit
-                chao_owners.update(box_chaoxian_owners(b))
-            return {
+                chao_owners.update(getattr(b, '_cached_chao_owners', set()))
+                if getattr(b, '_cached_public_type', get_public_box_type(b.box_type)) == 'Person':
+                    has_person_box = True
+                    person_box_count += 1
+                    person_w += b.weight
+                    person_l += b.length_unit
+                    person_owners.update(b.owners)
+                    for cid0, count0 in getattr(b, '_cached_person_counts', {}).items():
+                        person_counts[cid0] += count0
+                else:
+                    has_non_person_box = True
+                    non_person_box_count += 1
+                    non_person_w += b.weight
+                    non_person_l += b.length_unit
+                    non_person_owners.update(b.owners)
+            return UnitDict({
                 'box_indices': list(box_indices),
                 'owners': owners,
                 'weight': total_w,
                 'length': total_l,
                 'dominant': dominant_ratio(total_w, total_l, max_weight_per_sc, max_length_per_sc),
                 'has_chaoXian_equipment': len(chao_owners) > 0,
-                'chaoXian_owners': chao_owners
-            }
+                'chaoXian_owners': chao_owners,
+                # 以下均为内部缓存，不参与任何业务规则或最终出参。
+                '_person_owners': person_owners,
+                '_non_person_owners': non_person_owners,
+                '_person_counts': dict(person_counts),
+                '_has_person_box': has_person_box,
+                '_has_non_person_box': has_non_person_box,
+                '_person_w': person_w,
+                '_person_l': person_l,
+                '_non_person_w': non_person_w,
+                '_non_person_l': non_person_l,
+                '_person_box_count': person_box_count,
+                '_non_person_box_count': non_person_box_count,
+            })
+
+        _readonly_unit_cache = {}
+
+        def make_unit_readonly_cached(box_indices, forced_owners=None):
+            """只用于车辆搜索中的只读候选单元；业务字段与make_unit完全一致。"""
+            indices_key = tuple(box_indices)
+            owners_key = tuple(sorted(forced_owners)) if forced_owners else ()
+            key = (indices_key, owners_key)
+            unit = _readonly_unit_cache.get(key)
+            if unit is None:
+                unit = make_unit(list(indices_key), forced_owners=set(owners_key) if owners_key else None)
+                _readonly_unit_cache[key] = unit
+            return unit
 
         def split_company_into_chunks(cid, box_indices):
             """
@@ -1540,29 +1703,34 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 chunk['length'] += b.length_unit
                 chunk['dominant'] = dominant_ratio(chunk['weight'], chunk['length'], max_weight_per_sc,
                                                    max_length_per_sc)
-                chunk['chaoXian_owners'].update(box_chaoxian_owners(b))
+                chunk['chaoXian_owners'].update(getattr(b, '_cached_chao_owners', set()))
                 chunk['has_chaoXian_equipment'] = len(chunk['chaoXian_owners']) > 0
+                # 同步维护 make_unit 中的内部性能缓存；业务字段、评分和候选顺序均不变。
+                if getattr(b, '_cached_public_type', get_public_box_type(b.box_type)) == 'Person':
+                    chunk['_has_person_box'] = True
+                    chunk['_person_owners'].update(b.owners)
+                    chunk['_person_w'] += b.weight
+                    chunk['_person_l'] += b.length_unit
+                    chunk['_person_box_count'] += 1
+                    person_counts = chunk['_person_counts']
+                    for cid0, count0 in getattr(b, '_cached_person_counts', {}).items():
+                        person_counts[cid0] = person_counts.get(cid0, 0) + count0
+                else:
+                    chunk['_has_non_person_box'] = True
+                    chunk['_non_person_owners'].update(b.owners)
+                    chunk['_non_person_w'] += b.weight
+                    chunk['_non_person_l'] += b.length_unit
+                    chunk['_non_person_box_count'] += 1
 
             def chunk_person_nonperson_load(chunk):
-                person_w = person_l = non_person_w = non_person_l = 0.0
-                person_count = non_person_count = 0
-                for bi in chunk.get('box_indices', []):
-                    bb = all_sub_containers[bi]
-                    if get_public_box_type(bb.box_type) == 'Person':
-                        person_w += bb.weight
-                        person_l += bb.length_unit
-                        person_count += 1
-                    else:
-                        non_person_w += bb.weight
-                        non_person_l += bb.length_unit
-                        non_person_count += 1
+                # make_unit/add_box_to_chunk已同步维护，避免边界换长下对箱明细反复全扫描。
                 return {
-                    'person_w': person_w,
-                    'person_l': person_l,
-                    'non_person_w': non_person_w,
-                    'non_person_l': non_person_l,
-                    'person_count': person_count,
-                    'non_person_count': non_person_count,
+                    'person_w': chunk.get('_person_w', 0.0),
+                    'person_l': chunk.get('_person_l', 0.0),
+                    'non_person_w': chunk.get('_non_person_w', 0.0),
+                    'non_person_l': chunk.get('_non_person_l', 0.0),
+                    'person_count': chunk.get('_person_box_count', 0),
+                    'non_person_count': chunk.get('_non_person_box_count', 0),
                 }
 
             def best_chunk_for_box(chunks, box_idx, prefer_chao_chunk=False, spread_person=False):
@@ -1753,6 +1921,11 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
                 last_error = None
+                # 下列总量与target_count/排序策略无关，只计算一次。
+                total_person_l = sum(all_sub_containers[i].length_unit for i in person_indices)
+                total_person_w = sum(all_sub_containers[i].weight for i in person_indices)
+                total_non_person_l = sum(all_sub_containers[i].length_unit for i in non_person_indices)
+                total_non_person_w = sum(all_sub_containers[i].weight for i in non_person_indices)
 
                 def build_with_target_count(target_count, non_person_order=None, person_order=None):
                     """
@@ -1768,11 +1941,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     remaining_non_person = list(non_person_order if non_person_order is not None else base_ordered_non_person)
                     remaining_person = list(person_order if person_order is not None else base_ordered_person)
 
-                    total_person_l = sum(all_sub_containers[i].length_unit for i in person_indices)
-                    total_person_w = sum(all_sub_containers[i].weight for i in person_indices)
-                    total_non_person_l = sum(all_sub_containers[i].length_unit for i in non_person_indices)
-                    total_non_person_w = sum(all_sub_containers[i].weight for i in non_person_indices)
                     avg_non_person_l = total_non_person_l / target_count if target_count else total_non_person_l
+                    # 当前构造轮次内，人员箱列表及大量chunk状态会被重复查询。
+                    person_options_cache = {}
+                    reservation_cache = {}
 
                     def non_person_share_for_chunk(chunk):
                         """按非人员箱的换长/重量综合估计该块应分到的人员比例。"""
@@ -1797,67 +1969,172 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     def target_person_w_for_chunk(chunk):
                         return total_person_w * non_person_share_for_chunk(chunk)
 
+                    def _person_options(chunk, person_list):
+                        # box_indices和person_list顺序完整进入key，缓存不会改变原匹配顺序。
+                        # 人员箱能否放入只取决于当前块的重量、换长和人员箱列表；
+                        # 不同箱组合只要总重量/换长相同，其可选人员箱严格相同。
+                        key = (chunk.get('weight', 0.0), chunk.get('length', 0.0), tuple(person_list))
+                        cached = person_options_cache.get(key)
+                        if cached is None:
+                            cached = tuple(pi for pi in person_list if can_add_to_chunk(chunk, pi))
+                            person_options_cache[key] = cached
+                        return cached
+
                     def can_fit_any_person(chunk, person_list):
                         """单块快速预检：至少存在一个可放入的人员箱。"""
-                        return any(can_add_to_chunk(chunk, pi) for pi in person_list)
+                        return bool(_person_options(chunk, person_list))
 
                     def reserve_distinct_persons(candidate_chunks, person_list):
                         """为各个未配人员的非人员块分配一个互不重复的人员箱。
 
                         返回 ``{chunk_index: person_box_index}``；无可行匹配时返回 ``None``。
                         """
+                        cache_key = (
+                            tuple((
+                                c.get('weight', 0.0),
+                                c.get('length', 0.0),
+                                c.get('_person_box_count', 0),
+                                c.get('_non_person_box_count', 0),
+                            ) for c in candidate_chunks),
+                            tuple(person_list),
+                        )
+                        if cache_key in reservation_cache:
+                            cached = reservation_cache[cache_key]
+                            return None if cached is None else dict(cached)
+
                         need_chunks = []
                         for k, chunk0 in enumerate(candidate_chunks):
                             load0 = chunk_person_nonperson_load(chunk0)
                             if load0['non_person_count'] > 0 and load0['person_count'] == 0:
                                 need_chunks.append(k)
                         if len(need_chunks) > len(person_list):
+                            reservation_cache[cache_key] = None
                             return None
 
                         # 优先处理可选人员箱更少的块，降低匹配贪心误判概率。
+                        # 使用稠密下标和代际标记代替dict+set；DFS顺序与原实现完全一致。
+                        person_pos = {pi: pos for pos, pi in enumerate(person_list)}
                         choices = {}
                         for k in need_chunks:
-                            opts = [pi for pi in person_list if can_add_to_chunk(candidate_chunks[k], pi)]
+                            opts = _person_options(candidate_chunks[k], person_list)
                             if not opts:
+                                reservation_cache[cache_key] = None
                                 return None
-                            choices[k] = opts
+                            choices[k] = tuple(person_pos[pi] for pi in opts)
                         ordered_chunks = sorted(need_chunks, key=lambda k: len(choices[k]))
-                        person_to_chunk = {}
+                        person_to_chunk = [-1] * len(person_list)
+                        seen_marks = [0] * len(person_list)
+                        epoch = 0
 
-                        def augment(k, seen):
-                            for pi in choices[k]:
-                                if pi in seen:
+                        def augment(k):
+                            for pos in choices[k]:
+                                if seen_marks[pos] == epoch:
                                     continue
-                                seen.add(pi)
-                                old_k = person_to_chunk.get(pi)
-                                if old_k is None or augment(old_k, seen):
-                                    person_to_chunk[pi] = k
+                                seen_marks[pos] = epoch
+                                old_k = person_to_chunk[pos]
+                                if old_k < 0 or augment(old_k):
+                                    person_to_chunk[pos] = k
                                     return True
                             return False
 
-                        if not all(augment(k, set()) for k in ordered_chunks):
+                        matched = True
+                        for k in ordered_chunks:
+                            epoch += 1
+                            if not augment(k):
+                                matched = False
+                                break
+                        if not matched:
+                            reservation_cache[cache_key] = None
                             return None
-                        return {k: pi for pi, k in person_to_chunk.items()}
+                        result = {k: person_list[pos] for pos, k in enumerate(person_to_chunk) if k >= 0}
+                        reservation_cache[cache_key] = tuple(result.items())
+                        return result
 
                     def can_reserve_distinct_persons(candidate_chunks, person_list):
                         """全局预检：每个待配人员块都能预留一个不同的人员箱。"""
                         return reserve_distinct_persons(candidate_chunks, person_list) is not None
 
-                    def can_add_non_person_and_still_fit_person(chunk, np_idx, person_list):
+                    def _prepare_matching_context(base_chunks, person_list):
+                        matching = reserve_distinct_persons(base_chunks, person_list)
+                        if matching is None:
+                            return None
+                        person_pos = {pi: pos for pos, pi in enumerate(person_list)}
+                        owner_by_pos = [-1] * len(person_list)
+                        for k, pi in matching.items():
+                            owner_by_pos[person_pos[pi]] = k
+                        choice_positions = {
+                            k: tuple(person_pos[pi] for pi in _person_options(base_chunks[k], person_list))
+                            for k in matching
+                        }
+                        return matching, person_pos, owner_by_pos, choice_positions
+
+                    def _can_repair_matching_after_one_chunk_change(
+                            base_chunks, changed_pos, changed_chunk, person_list, matching_context):
+                        """复用当前匹配，只对一个发生变化的块执行增量修复。"""
+                        if matching_context is None:
+                            # 加入一个非人员箱只会收紧容量或增加待配块，不可能把原不可行变可行。
+                            return False
+
+                        base_matching, person_pos, base_owner_by_pos, base_choice_positions = matching_context
+                        changed_load = chunk_person_nonperson_load(changed_chunk)
+                        changed_needs_person = (
+                            changed_load['non_person_count'] > 0 and changed_load['person_count'] == 0
+                        )
+                        if not changed_needs_person:
+                            return True
+
+                        assigned = base_matching.get(changed_pos)
+                        if assigned is not None and can_add_to_chunk(changed_chunk, assigned):
+                            return True
+
+                        changed_choices = tuple(
+                            person_pos[pi] for pi in _person_options(changed_chunk, person_list)
+                        )
+                        if not changed_choices:
+                            return False
+
+                        owner_by_pos = list(base_owner_by_pos)
+                        if assigned is not None:
+                            owner_by_pos[person_pos[assigned]] = -1
+                        seen = [False] * len(person_list)
+
+                        def choices_for(k):
+                            return changed_choices if k == changed_pos else base_choice_positions[k]
+
+                        def augment(k):
+                            for pos in choices_for(k):
+                                if seen[pos]:
+                                    continue
+                                seen[pos] = True
+                                old_k = owner_by_pos[pos]
+                                if old_k < 0 or augment(old_k):
+                                    owner_by_pos[pos] = k
+                                    return True
+                            return False
+
+                        return augment(changed_pos)
+
+                    def _matching_candidate_after_non_person(chunk, box_idx):
+                        """只构造人员预留判断所需字段，数值与完整make_unit候选完全一致。"""
+                        b = all_sub_containers[box_idx]
+                        return UnitDict({
+                            'weight': chunk['weight'] + b.weight,
+                            'length': chunk['length'] + b.length_unit,
+                            '_person_box_count': chunk.get('_person_box_count', 0),
+                            '_non_person_box_count': chunk.get('_non_person_box_count', 0) + 1,
+                        })
+
+                    def can_add_non_person_and_still_fit_person(
+                            chunk, np_idx, person_list, chunk_pos, matching_context):
                         """非人员箱加入后，须为各块全局预留互不重复的人员箱。"""
                         if not can_add_to_chunk(chunk, np_idx):
                             return False
-                        tmp_indices = list(chunk.get('box_indices', [])) + [np_idx]
-                        tmp_chunk = make_unit(tmp_indices, forced_owners={cid})
+                        tmp_chunk = _matching_candidate_after_non_person(chunk, np_idx)
                         if not can_fit_any_person(tmp_chunk, person_list):
                             return False
-                        candidate_chunks = list(chunks)
-                        try:
-                            chunk_pos = next(k for k, value in enumerate(chunks) if value is chunk)
-                        except StopIteration:
-                            return False
-                        candidate_chunks[chunk_pos] = tmp_chunk
-                        return can_reserve_distinct_persons(candidate_chunks, person_list)
+                        return _can_repair_matching_after_one_chunk_change(
+                            chunks, chunk_pos, tmp_chunk, person_list, matching_context
+                        )
 
                     def try_relocate_non_person_for_reservation(chunks, pending_idx, person_list):
                         """一跳搬移修复非人员箱的贪心死路。
@@ -1881,16 +2158,16 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                             for move_idx in movable:
                                 src_after = [bi for bi in src['box_indices'] if bi != move_idx] + [pending_idx]
                                 new_src = make_unit(src_after, forced_owners={cid})
-                                if (new_src.weight > max_weight_per_sc + 1e-6 or
-                                        new_src.length > max_length_per_sc + 1e-6):
+                                if (new_src['weight'] > max_weight_per_sc + 1e-6 or
+                                        new_src['length'] > max_length_per_sc + 1e-6):
                                     continue
                                 for dst_k, dst in enumerate(chunks):
                                     if dst_k == src_k:
                                         continue
                                     dst_after = list(dst['box_indices']) + [move_idx]
                                     new_dst = make_unit(dst_after, forced_owners={cid})
-                                    if (new_dst.weight > max_weight_per_sc + 1e-6 or
-                                            new_dst.length > max_length_per_sc + 1e-6):
+                                    if (new_dst['weight'] > max_weight_per_sc + 1e-6 or
+                                            new_dst['length'] > max_length_per_sc + 1e-6):
                                         continue
                                     candidate_chunks = list(chunks)
                                     candidate_chunks[src_k] = new_src
@@ -1921,8 +2198,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
                         best_pos = None
                         best_score = None
+                        matching_context = _prepare_matching_context(chunks, remaining_person)
                         for pos, idx in enumerate(remaining_non_person):
-                            if not can_add_non_person_and_still_fit_person(chunks[k], idx, remaining_person):
+                            if not can_add_non_person_and_still_fit_person(
+                                    chunks[k], idx, remaining_person, k, matching_context):
                                 continue
                             b = all_sub_containers[idx]
                             # 种子阶段优先放较大的非人员箱，使大箱先获得人员容量保障。
@@ -1944,8 +2223,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         best_k = None
                         best_score = None
                         b = all_sub_containers[idx]
+                        matching_context = _prepare_matching_context(chunks, remaining_person)
                         for k, chunk in enumerate(chunks):
-                            if not can_add_non_person_and_still_fit_person(chunk, idx, remaining_person):
+                            if not can_add_non_person_and_still_fit_person(
+                                    chunk, idx, remaining_person, k, matching_context):
                                 continue
                             load = chunk_person_nonperson_load(chunk)
                             new_non_l = load['non_person_l'] + b.length_unit
@@ -2074,12 +2355,13 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 best_score = None
                 best_target_count = None
                 best_strategy = ''
+                order_variant_list = order_variants()
 
                 # 从理论下界开始尝试；如果为了满足人-物同车或均衡需要增加车辆数，则逐步增加。
                 # 不再遇到第一个可行方案就返回，避免45/55可行而50被局部贪心误判，
                 # 同时避免公司内部产生40、26这类明显不均衡的块。
                 for target_count in range(lower_count, max_mixed_count + 1):
-                    for strategy_name, np_order, p_order in order_variants():
+                    for strategy_name, np_order, p_order in order_variant_list:
                         chunks, err = build_with_target_count(target_count, np_order, p_order)
                         if chunks is not None:
                             score = chunks_balance_score(chunks)
@@ -2253,56 +2535,33 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
         def vehicle_respects_person_nonperson_rule(vehicle):
             """搬移预检：任何涉及人-物同车硬规则的公司，在单车内不得只出现一种类型。"""
-            per_company = defaultdict(lambda: {'person': False, 'non_person': False})
+            person_owners = set()
+            non_person_owners = set()
             for unit in vehicle.units:
-                for idx0 in unit['box_indices']:
-                    box = all_sub_containers[idx0]
-                    public_type = get_public_box_type(getattr(box, 'box_type', ''))
-                    for cid0 in getattr(box, 'owners', set()):
-                        if public_type == 'Person':
-                            per_company[cid0]['person'] = True
-                        else:
-                            per_company[cid0]['non_person'] = True
-            for cid0, flags in per_company.items():
-                if cid0 in companies_need_mixed_final and flags.get('person') != flags.get('non_person'):
+                person_owners.update(unit.get('_person_owners', set()))
+                non_person_owners.update(unit.get('_non_person_owners', set()))
+            for cid0 in person_owners | non_person_owners:
+                if cid0 in companies_need_mixed_final and ((cid0 in person_owners) != (cid0 in non_person_owners)):
                     return False
             return True
 
         def unit_has_person_box(unit):
-            return any(
-                get_public_box_type(all_sub_containers[bi].box_type) == 'Person'
-                for bi in unit.get('box_indices', [])
-            )
+            return bool(unit.get('_has_person_box', False))
 
         def unit_has_non_person_box(unit):
-            return any(
-                get_public_box_type(all_sub_containers[bi].box_type) != 'Person'
-                for bi in unit.get('box_indices', [])
-            )
+            return bool(unit.get('_has_non_person_box', False))
 
         def box_person_count_for_company(box, cid0):
-            if get_public_box_type(getattr(box, 'box_type', '')) != 'Person':
-                return 0
-            total = 0
-            for item in getattr(box, 'contents', []):
-                if item.get('type') == 'person' and item.get('company_id', '') == cid0:
-                    total += safe_int(item.get('count'), 0)
-            return total
+            return getattr(box, '_cached_person_counts', {}).get(cid0, 0)
 
         def unit_person_count_for_company(unit, cid0):
-            return sum(
-                box_person_count_for_company(all_sub_containers[bi], cid0)
-                for bi in unit.get('box_indices', [])
-            )
+            return unit.get('_person_counts', {}).get(cid0, 0)
 
         def vehicle_person_count_for_company(vehicle, cid0):
-            return sum(unit_person_count_for_company(unit, cid0) for unit in vehicle.units)
+            return vehicle._person_counts.get(cid0, 0)
 
         def vehicle_has_company(vehicle, cid0):
-            for unit in vehicle.units:
-                if cid0 in unit.get('owners', set()):
-                    return True
-            return False
+            return cid0 in vehicle.companies
 
         def company_people_distribution_penalty(vehicle_list):
             """同一公司人员在其所在车辆上的均衡软惩罚。
@@ -2371,8 +2630,93 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             weight_range_penalty = (max(weights) - min(weights)) ** 2 / max(max_weight_per_sc, 1.0) if len(weights) > 1 else 0.0
             return 7.50 * under_penalty + 1.15 * target_penalty + 2.20 * range_penalty + 0.35 * full_range_penalty + 0.04 * weight_range_penalty
 
-        def clone_vehicle_list(vehicle_list):
-            return [v.clone() for v in vehicle_list if v.units]
+        def _people_penalty_for_counts(counts):
+            """与 company_people_distribution_penalty 中单公司公式完全一致。"""
+            if len(counts) <= 1 or sum(counts) <= 0:
+                return 0.0
+            avg = sum(counts) / len(counts)
+            if avg <= 1e-9:
+                return 0.0
+            rel_var = sum(((c - avg) / avg) ** 2 for c in counts) / len(counts)
+            allowed_gap = max(PERSON_BALANCE_MAX_ABS_GAP, avg * PERSON_BALANCE_MAX_RATIO)
+            range_over = max(0.0, max(counts) - min(counts) - allowed_gap) / max(avg, 1.0)
+            return rel_var + 1.50 * (range_over ** 2)
+
+        class _ObjectiveIterationCache:
+            """单次搜索迭代的等价评分缓存。
+
+            每个候选只改变 donor/receiver 两辆车，因此：
+            - 车队换长目标仍按原函数逐车计算；
+            - 人员均衡、公司分散度仅重算受影响公司；
+            - 最终仍按 company_name 原插入顺序累加，避免改变候选比较顺序。
+            """
+            __slots__ = (
+                'vehicles', 'company_order', 'people_contrib', 'spread_contrib',
+                'people_total', 'spread_total'
+            )
+
+            def __init__(self, vehicles):
+                self.vehicles = vehicles
+                self.company_order = tuple(company_name.keys())
+                self.people_contrib = {}
+                self.spread_contrib = {}
+                for cid0 in self.company_order:
+                    counts = [v._person_counts.get(cid0, 0) for v in vehicles if cid0 in v.companies]
+                    self.people_contrib[cid0] = _people_penalty_for_counts(counts)
+                    vehicle_count = sum(1 for v in vehicles if cid0 in v.companies)
+                    self.spread_contrib[cid0] = (vehicle_count - 1) ** 2 if vehicle_count > 1 else 0.0
+                # 保持原公司顺序累加。
+                people_total = 0.0
+                spread_total = 0.0
+                for cid0 in self.company_order:
+                    people_total += self.people_contrib[cid0]
+                    spread_total += self.spread_contrib[cid0]
+                self.people_total = people_total
+                self.spread_total = spread_total
+
+            @staticmethod
+            def affected_companies(old_donor, old_receiver, new_donor, new_receiver):
+                affected = set(old_donor.companies) | set(old_receiver.companies)
+                affected.update(new_donor.companies)
+                affected.update(new_receiver.companies)
+                affected.update(old_donor._person_counts.keys())
+                affected.update(old_receiver._person_counts.keys())
+                affected.update(new_donor._person_counts.keys())
+                affected.update(new_receiver._person_counts.keys())
+                return affected
+
+            def penalties(self, candidate, affected):
+                # 按原company_name插入顺序累加，确保评分计算顺序与原函数一致。
+                replacement_people = {}
+                replacement_spread = {}
+                for cid0 in affected:
+                    if cid0 not in self.people_contrib:
+                        continue
+                    counts = [v._person_counts.get(cid0, 0) for v in candidate if cid0 in v.companies]
+                    replacement_people[cid0] = _people_penalty_for_counts(counts)
+                    vehicle_count = sum(1 for v in candidate if cid0 in v.companies)
+                    replacement_spread[cid0] = (vehicle_count - 1) ** 2 if vehicle_count > 1 else 0.0
+                people_total = 0.0
+                spread_total = 0.0
+                for cid0 in self.company_order:
+                    people_total += replacement_people.get(cid0, self.people_contrib[cid0])
+                    spread_total += replacement_spread.get(cid0, self.spread_contrib[cid0])
+                return people_total, spread_total
+
+            def objective(self, candidate, affected):
+                people_penalty, spread_penalty = self.penalties(candidate, affected)
+                return (
+                    fleet_balance_objective(candidate)
+                    + PERSON_BALANCE_WEIGHT * (max_length_per_sc ** 2) * people_penalty
+                    + COMPANY_SPREAD_WEIGHT * (max_length_per_sc ** 2) * spread_penalty
+                )
+
+        def clone_vehicle_list_for_move(vehicle_list, donor_idx, receiver_idx):
+            """候选搬移只复制会发生变化的供给车和接收车，其余车辆只读共享。"""
+            candidate = list(vehicle_list)
+            candidate[donor_idx] = vehicle_list[donor_idx].clone()
+            candidate[receiver_idx] = vehicle_list[receiver_idx].clone()
+            return candidate
 
         def balance_vehicles_by_unit_moves(vehicle_list):
             """车辆层换长均衡后处理。
@@ -2388,25 +2732,41 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             if len(vehicles_local) <= 1:
                 return vehicles_local
 
-            def valid_after_move(candidate):
-                return all(v.units and vehicle_respects_person_nonperson_rule(v) for v in candidate)
+            base_vehicle_validity = []
+
+            def valid_after_move(candidate, donor_idx, receiver_idx):
+                # 本候选只改变供给车和接收车；其余车辆复用本轮开始时的相同硬校验结果。
+                for vi, vehicle in enumerate(candidate):
+                    if not vehicle.units:
+                        continue
+                    if vi == donor_idx or vi == receiver_idx:
+                        if not vehicle_respects_person_nonperson_rule(vehicle):
+                            return False
+                    elif not base_vehicle_validity[vi]:
+                        return False
+                return True
 
             current_score = overall_balance_objective(vehicles_local)
             for _ in range(BALANCE_MAX_ITERATIONS):
+                objective_cache = _ObjectiveIterationCache(vehicles_local)
+                base_vehicle_validity = [vehicle_respects_person_nonperson_rule(v) for v in vehicles_local]
                 best = None
                 best_score = current_score
                 under_order = sorted(
                     range(len(vehicles_local)),
                     key=lambda i: (vehicles_local[i].length, vehicles_local[i].weight),
                 )
+                lengths = [v.length for v in vehicles_local]
+                length_gap = max(lengths) - min(lengths)
+                donor_units_cache = {}
+                move_options_cache = {}
 
                 for receiver_idx in under_order:
                     receiver = vehicles_local[receiver_idx]
                     # 低于目标下限，或全局最大/最小换长差距过大时才主动补车。
-                    lengths = [v.length for v in vehicles_local]
                     need_fill = (
                         receiver.length < max_length_per_sc * BALANCE_MIN_LENGTH_RATIO - 1e-6
-                        or (max(lengths) - min(lengths)) > max_length_per_sc * BALANCE_MAX_GAP_RATIO + 1e-6
+                        or length_gap > max_length_per_sc * BALANCE_MAX_GAP_RATIO + 1e-6
                     )
                     if not need_fill:
                         continue
@@ -2416,15 +2776,21 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         for donor_idx, donor in enumerate(vehicles_local):
                             if donor_idx == receiver_idx or donor.length <= receiver.length + 1e-6:
                                 continue
-                            donor_units = sorted(
-                                list(donor.units),
-                                key=lambda u: (u['length'], u['weight'], u['dominant']),
-                            )
+                            donor_units = donor_units_cache.get(donor_idx)
+                            if donor_units is None:
+                                donor_units = sorted(
+                                    list(donor.units),
+                                    key=lambda u: (u['length'], u['weight'], u['dominant']),
+                                )
+                                donor_units_cache[donor_idx] = donor_units
                             for unit in donor_units:
                                 # 候选搬移粒度：先尝试完整装车单元；若单元过粗，再尝试搬移其中一个原始小箱。
                                 # 小箱级搬移只在最终硬校验仍满足时接受，用于修复40/26这类尾车不均衡。
-                                move_options = [('unit', unit, None)]
-                                if len(unit.get('box_indices', [])) > 1:
+                                unit_cache_key = id(unit)
+                                move_options = move_options_cache.get(unit_cache_key)
+                                if move_options is None:
+                                    move_options = [('unit', unit, None)]
+                                if move_options_cache.get(unit_cache_key) is None and len(unit.get('box_indices', [])) > 1:
                                     single_boxes = sorted(
                                         list(unit.get('box_indices', [])),
                                         key=lambda bi: (
@@ -2434,7 +2800,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                         ),
                                     )
                                     for bi in single_boxes:
-                                        move_options.append(('single_box', make_unit([bi]), bi))
+                                        move_options.append(('single_box', make_unit_readonly_cached([bi]), bi))
 
                                     # 对跨公司补车很关键：如果单独搬一个其他公司的物资/人员箱会破坏
                                     # “该公司在每辆车中必须人-物同车”的硬规则，则尝试搬一个最小成组包。
@@ -2463,7 +2829,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                                 if len(bundle) < 2 or bundle in bundle_seen:
                                                     continue
                                                 bundle_seen.add(bundle)
-                                                move_options.append(('mixed_bundle', make_unit(list(bundle), forced_owners={owner0}), None))
+                                                move_options.append(('mixed_bundle', make_unit_readonly_cached(list(bundle), forced_owners={owner0}), None))
+                                if unit_cache_key not in move_options_cache:
+                                    move_options_cache[unit_cache_key] = move_options
 
                                 for move_kind, moving_unit, single_box_idx in move_options:
                                     same_company = bool(moving_unit['owners'] & receiver.companies)
@@ -2480,7 +2848,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                     if donor_after_length > 1e-6 and donor_after_length < max_length_per_sc * (BALANCE_MIN_LENGTH_RATIO - 0.08):
                                         continue
 
-                                    candidate = clone_vehicle_list(vehicles_local)
+                                    candidate = clone_vehicle_list_for_move(vehicles_local, donor_idx, receiver_idx)
                                     cand_unit = None
                                     for u in candidate[donor_idx].units:
                                         if u is unit or u == unit:
@@ -2496,16 +2864,20 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                         moving_indices = set(moving_unit.get('box_indices', []))
                                         rest_indices = [bi for bi in cand_unit.get('box_indices', []) if bi not in moving_indices]
                                         if rest_indices:
-                                            rest_unit = make_unit(rest_indices)
+                                            rest_unit = make_unit_readonly_cached(rest_indices)
                                             if not candidate[donor_idx].can_place(rest_unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
                                                 continue
                                             candidate[donor_idx].place(rest_unit, company_yingji_name)
                                         candidate[receiver_idx].place(moving_unit, company_yingji_name)
 
-                                    candidate = [v for v in candidate if v.units]
-                                    if not valid_after_move(candidate):
+                                    if not valid_after_move(candidate, donor_idx, receiver_idx):
                                         continue
-                                    new_score = overall_balance_objective(candidate)
+                                    affected = objective_cache.affected_companies(
+                                        vehicles_local[donor_idx], vehicles_local[receiver_idx],
+                                        candidate[donor_idx], candidate[receiver_idx]
+                                    )
+                                    new_score = objective_cache.objective(candidate, affected)
+                                    candidate = [v for v in candidate if v.units]
                                     # 同公司搬移优先；跨公司搬移必须在补换长/少浪费方面带来更明确收益，且评分会惩罚公司过度分散。
                                     improvement_tol = 1e-7 if same_company else 5e-4
                                     if new_score < best_score - improvement_tol:
@@ -2533,8 +2905,18 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             if len(vehicles_local) <= 1:
                 return vehicles_local
 
-            def valid_after_move(candidate):
-                return all(v.units and vehicle_respects_person_nonperson_rule(v) for v in candidate)
+            base_vehicle_validity = []
+
+            def valid_after_move(candidate, donor_idx, receiver_idx):
+                for vi, vehicle in enumerate(candidate):
+                    if not vehicle.units:
+                        continue
+                    if vi == donor_idx or vi == receiver_idx:
+                        if not vehicle_respects_person_nonperson_rule(vehicle):
+                            return False
+                    elif not base_vehicle_validity[vi]:
+                        return False
+                return True
 
             def company_vehicle_counts(vehicle_list0, cid0):
                 pairs = []
@@ -2555,9 +2937,11 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
             current_score = overall_balance_objective(vehicles_local)
             for _ in range(BALANCE_MAX_ITERATIONS):
+                objective_cache = _ObjectiveIterationCache(vehicles_local)
+                base_vehicle_validity = [vehicle_respects_person_nonperson_rule(v) for v in vehicles_local]
                 best = None
                 best_score = current_score
-                current_people_penalty = company_people_distribution_penalty(vehicles_local)
+                current_people_penalty = objective_cache.people_total
 
                 for cid0 in company_name.keys():
                     counts = company_vehicle_counts(vehicles_local, cid0)
@@ -2589,7 +2973,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                 key=lambda x: (box_person_count_for_company(all_sub_containers[x], cid0), all_sub_containers[x].length_unit),
                                 reverse=True,
                             ):
-                                moving_unit = make_unit([bi], forced_owners={cid0})
+                                moving_unit = make_unit_readonly_cached([bi], forced_owners={cid0})
                                 move_options.append((unit, moving_unit, bi))
 
                         for receiver_idx, receiver_count in low_list:
@@ -2600,7 +2984,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                 if not receiver.can_place(moving_unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
                                     continue
                                 # 如果搬移人数明显超过低车缺口，仍允许尝试，但评分会自然惩罚过度搬移。
-                                candidate = clone_vehicle_list(vehicles_local)
+                                candidate = clone_vehicle_list_for_move(vehicles_local, donor_idx, receiver_idx)
                                 cand_source_unit = None
                                 for u in candidate[donor_idx].units:
                                     if u == source_unit:
@@ -2612,17 +2996,24 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                 candidate[donor_idx].remove(cand_source_unit, company_yingji_name)
                                 rest_indices = [bi for bi in cand_source_unit.get('box_indices', []) if bi != single_box_idx]
                                 if rest_indices:
-                                    rest_unit = make_unit(rest_indices)
+                                    rest_unit = make_unit_readonly_cached(rest_indices)
                                     if not candidate[donor_idx].can_place(rest_unit, max_weight_per_sc, max_length_per_sc, company_yingji_name):
                                         continue
                                     candidate[donor_idx].place(rest_unit, company_yingji_name)
                                 candidate[receiver_idx].place(moving_unit, company_yingji_name)
-                                candidate = [v for v in candidate if v.units]
-
-                                if not valid_after_move(candidate):
+                                if not valid_after_move(candidate, donor_idx, receiver_idx):
                                     continue
-                                new_people_penalty = company_people_distribution_penalty(candidate)
-                                new_score = overall_balance_objective(candidate)
+                                affected = objective_cache.affected_companies(
+                                    vehicles_local[donor_idx], vehicles_local[receiver_idx],
+                                    candidate[donor_idx], candidate[receiver_idx]
+                                )
+                                new_people_penalty, new_spread_penalty = objective_cache.penalties(candidate, affected)
+                                new_score = (
+                                    fleet_balance_objective(candidate)
+                                    + PERSON_BALANCE_WEIGHT * (max_length_per_sc ** 2) * new_people_penalty
+                                    + COMPANY_SPREAD_WEIGHT * (max_length_per_sc ** 2) * new_spread_penalty
+                                )
+                                candidate = [v for v in candidate if v.units]
                                 # 人员分布必须确实改善；整体换长均衡不能明显变差。
                                 if new_people_penalty >= current_people_penalty - 1e-9:
                                     continue
@@ -2837,11 +3228,14 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         raise AlgorithmError(
                             f'装备 {name or comp_id} 在SC内Large重装失败：zzsbid={zzsbid}, 请检查zzsbidNumber或尾数拼箱规则'
                         )
-                    open_large_repacked[zzsbid].append(new_box)
+                    if not getattr(new_box, 'goods_closed', False):
+                        open_large_repacked[zzsbid].append(new_box)
                     virtual_boxes.append((None, new_box))
                 else:
                     if not best_box.add_item(cid, item, w, occupancy, item_volume=vol):
                         raise AlgorithmError(f'装备 {name or comp_id} 在SC内Large混装失败')
+                    if getattr(best_box, 'goods_closed', False):
+                        open_large_repacked[zzsbid].remove(best_box)
 
             # === Small物资二次重装：保持原规则 ===
             goods_items = prepare_goods_items_for_tailmix(goods_items)
@@ -2909,11 +3303,14 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         raise AlgorithmError(
                             f'物资 {name or gid} 在SC内重装失败：weight={w:.1f}, tj={tj:.2f}, zzsbid={zzsbid}'
                         )
-                    open_repacked[zzsbid].append(new_box)
+                    if not getattr(new_box, 'goods_closed', False):
+                        open_repacked[zzsbid].append(new_box)
                     virtual_boxes.append((None, new_box))
                 else:
                     if not best_box.add_item(cid, item, w, 0.0, item_volume=tj):
                         raise AlgorithmError(f'物资 {name or gid} 在SC内混装失败')
+                    if getattr(best_box, 'goods_closed', False):
+                        open_repacked[zzsbid].remove(best_box)
 
             return fixed_boxes + virtual_boxes
 
@@ -2925,6 +3322,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 "SC_list": []
             }
         }
+
+        assigned_indices_by_vehicle = [[] for _ in range(total_sc_used)]
+        for idx0, assign0 in enumerate(heuristic_assign):
+            assigned_indices_by_vehicle[assign0].append(idx0)
 
         for v in range(total_sc_used):
             sc_info = {
@@ -2938,7 +3339,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             curr_l = 0.0
             has_mixed = False
 
-            merged_indices = [i for i, assign in enumerate(heuristic_assign) if assign == v]
+            merged_indices = assigned_indices_by_vehicle[v]
             sc_source_boxes = []
             for i in merged_indices:
                 for orig_idx in merge_map[i]:
@@ -3253,38 +3654,59 @@ def build_entities(box, company_yingji_name=None):
 
 
 # ========================== 服务状态 ==========================
+class ServiceState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.status = "初始化中"
+        self.detail = "程序启动中"
+        self.last_error = ""
+        self.started_at: Optional[float] = None
 
-atexit.register(ALGO_EXECUTOR.shutdown, wait=False, cancel_futures=False)
+    def set(self, status: str, detail: str = "", last_error: str = "") -> None:
+        with self._lock:
+            self.status = status
+            self.detail = detail
+            if last_error:
+                self.last_error = last_error
+            elif status not in {"启动失败", "运行异常"}:
+                self.last_error = ""
+            if status == "运行中" and self.started_at is None:
+                self.started_at = time.time()
+            if status in {"已停止", "启动失败", "运行异常"}:
+                self.started_at = None if status != "运行异常" else self.started_at
+        logger.info("服务状态更新: %s - %s", status, detail)
 
-def build_cors_origins() -> List[str]:
-    raw = os.getenv("RAILWAY_CORS_ALLOW_ORIGINS", "*").strip()
-    if raw == "*" or not raw:
-        return ["*"]
-    return [item.strip() for item in raw.split(",") if item.strip()]
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "status": self.status,
+                "detail": self.detail,
+                "last_error": self.last_error,
+                "started_at": self.started_at,
+            }
 
 
-app = FastAPI(title=APP_TITLE)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=build_cors_origins(),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+SERVICE_STATE = ServiceState()
+
+# ========================== FastAPI 接口 ==========================
+app = FastAPI(title="铁路运输配载优化")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get(HEALTH_PATH)
-async def health() -> Dict[str, Any]:
+def health_check():
+    snapshot = SERVICE_STATE.snapshot()
     return {
-        "status": "ok",
-        "app": APP_TITLE,
-        "host": API_HOST,
-        "port": API_PORT,
+        "status": snapshot["status"],
+        "detail": snapshot["detail"],
+        "server_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "build_version": BUILD_VERSION,
     }
 
 
 @app.post("/api/v1/optimize")
 async def optimize(req: OptimizationRequest, request: Request):
-    request_id = uuid4().hex[:8]
+    request_id = uuid.uuid4().hex[:8]
     client_host = request.client.host if request.client else "unknown"
     logger.info("[%s] 收到计算请求，来源=%s", request_id, client_host)
 
@@ -3330,7 +3752,7 @@ async def optimize(req: OptimizationRequest, request: Request):
     return result
 
 
-# ========================== 网络/启动辅助 ==========================
+# ========================== 网络/进程辅助 ==========================
 def can_bind_port(host: str, port: int) -> bool:
     test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -3341,6 +3763,24 @@ def can_bind_port(host: str, port: int) -> bool:
         return False
     finally:
         test_sock.close()
+
+
+def is_api_reachable(timeout: float = 1.5) -> bool:
+    conn = None
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", API_PORT, timeout=timeout)
+        conn.request("GET", HEALTH_PATH)
+        resp = conn.getresponse()
+        resp.read()
+        return 200 <= resp.status < 500
+    except Exception:
+        return False
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def detect_local_ipv4_addresses() -> List[str]:
@@ -3368,41 +3808,217 @@ def detect_local_ipv4_addresses() -> List[str]:
     except Exception:
         pass
 
-    deduped: List[str] = []
+    deduped = []
     seen = set()
     for ip in candidates:
         if ip not in seen:
             seen.add(ip)
             deduped.append(ip)
 
-    return deduped if deduped else ["127.0.0.1"]
+    if deduped:
+        return deduped
+    return ["127.0.0.1"]
 
 
-def log_startup_banner() -> None:
-    ip_list = detect_local_ipv4_addresses()
-    logger.info("程序启动，目录=%s", APP_DIR)
-    logger.info("日志文件=%s", LOG_PATH)
-    logger.info("服务监听=%s:%s", API_HOST, API_PORT)
-    for ip in ip_list:
-        logger.info("接口地址=http://%s:%s/api/v1/optimize", ip, API_PORT)
+# ========================== 服务管理 ==========================
+class ServerManager:
+    def __init__(self):
+        self.server: Optional[uvicorn.Server] = None
+        self.server_thread: Optional[threading.Thread] = None
+        self.stop_event = threading.Event()
+        self.server_exception: Optional[BaseException] = None
+        self._lock = threading.Lock()
+
+    def _server_worker(self):
+        try:
+            config = uvicorn.Config(
+                app,
+                host=API_HOST,
+                port=API_PORT,
+                log_config=None,
+                access_log=False,
+                lifespan="off",
+            )
+            self.server = uvicorn.Server(config)
+            self.server.run()
+        except BaseException as exc:
+            self.server_exception = exc
+            logger.exception("服务线程异常退出")
+        finally:
+            logger.info("服务线程已结束")
+
+    def start(self) -> bool:
+        with self._lock:
+            if self.server_thread and self.server_thread.is_alive():
+                SERVICE_STATE.set("运行中", f"服务已在 {API_PORT} 端口运行")
+                return True
+
+            if not can_bind_port("0.0.0.0", API_PORT):
+                msg = f"端口 {API_PORT} 已被占用，服务未启动"
+                SERVICE_STATE.set("启动失败", msg, msg)
+                logger.error(msg)
+                return False
+
+            self.stop_event.clear()
+            self.server_exception = None
+            SERVICE_STATE.set("启动中", f"正在启动 {API_PORT} 端口服务")
+            self.server_thread = threading.Thread(target=self._server_worker, name="uvicorn-server", daemon=False)
+            self.server_thread.start()
+
+        deadline = time.time() + SERVER_START_TIMEOUT
+        while time.time() < deadline:
+            if self.server_exception:
+                msg = f"服务启动失败: {self.server_exception}"
+                SERVICE_STATE.set("启动失败", msg, msg)
+                return False
+            if self.server and getattr(self.server, "started", False) and is_api_reachable():
+                SERVICE_STATE.set("运行中", f"服务已监听 0.0.0.0:{API_PORT}")
+                return True
+            if self.server_thread and not self.server_thread.is_alive():
+                msg = "服务线程已退出，启动失败"
+                SERVICE_STATE.set("启动失败", msg, msg)
+                return False
+            time.sleep(0.2)
+
+        msg = f"服务在 {SERVER_START_TIMEOUT:.0f} 秒内未完成启动"
+        SERVICE_STATE.set("启动失败", msg, msg)
+        logger.error(msg)
+        return False
+
+    def stop(self) -> None:
+        with self._lock:
+            SERVICE_STATE.set("停止中", "正在停止服务")
+            if self.server:
+                self.server.should_exit = True
+            thread = self.server_thread
+
+        if thread and thread.is_alive():
+            thread.join(timeout=SERVER_STOP_TIMEOUT)
+
+        if thread and thread.is_alive():
+            msg = "服务未能在限定时间内正常停止"
+            SERVICE_STATE.set("运行异常", msg, msg)
+            logger.error(msg)
+        else:
+            SERVICE_STATE.set("已停止", "服务已停止")
+
+    def monitor_loop(self):
+        while not self.stop_event.is_set():
+            time.sleep(SERVER_MONITOR_INTERVAL)
+            snapshot = SERVICE_STATE.snapshot()
+            if snapshot["status"] not in {"运行中", "运行异常"}:
+                continue
+            if self.server_thread and not self.server_thread.is_alive():
+                msg = "检测到服务线程已退出"
+                SERVICE_STATE.set("运行异常", msg, msg)
+                logger.error(msg)
+                continue
+            if snapshot["status"] == "运行中" and not is_api_reachable():
+                msg = "检测到服务健康检查失败"
+                SERVICE_STATE.set("运行异常", msg, msg)
+                logger.error(msg)
+
+    def shutdown_monitor(self):
+        self.stop_event.set()
+
+
+SERVER_MANAGER = ServerManager()
+
+
+class SingleInstanceGuard:
+    def __init__(self, host: str = "127.0.0.1", port: int = INSTANCE_LOCK_PORT):
+        self.host = host
+        self.port = port
+        self.sock: Optional[socket.socket] = None
+
+    def acquire(self) -> bool:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.sock.bind((self.host, self.port))
+            self.sock.listen(1)
+            return True
+        except OSError:
+            if self.sock:
+                self.sock.close()
+            self.sock = None
+            return False
+
+    def release(self) -> None:
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+
+INSTANCE_GUARD = SingleInstanceGuard()
+atexit.register(INSTANCE_GUARD.release)
+atexit.register(SERVER_MANAGER.shutdown_monitor)
+atexit.register(ALGO_EXECUTOR.shutdown, wait=False, cancel_futures=False)
+
+
+# ========================== Linux 无界面启动入口 ==========================
+_LINUX_SHUTDOWN_EVENT = threading.Event()
+
+
+def _linux_signal_handler(signum, _frame):
+    """接收 systemd/docker/终端停止信号，在主循环中执行正常停机。"""
+    logger.info("收到 Linux 停止信号: %s", signum)
+    _LINUX_SHUTDOWN_EVENT.set()
 
 
 def bootstrap() -> None:
-    configure_process_signals()
+    """Linux 服务器无界面启动。
 
-    if not can_bind_port(API_HOST, API_PORT):
-        logger.error("端口 %s 已被占用，程序退出", API_PORT)
-        raise SystemExit(1)
+    仅替换原来的 Tk/系统托盘启动层；FastAPI 接口、算法、业务规则、
+    并发控制、日志和输入输出结构保持不变。
+    """
+    if not INSTANCE_GUARD.acquire():
+        msg = "检测到程序已在运行，请勿重复启动。"
+        logger.warning(msg)
+        print(msg)
+        return
 
-    log_startup_banner()
-    uvicorn.run(
-        app,
-        host=API_HOST,
-        port=API_PORT,
-        log_config=None,
-        access_log=False,
-        timeout_keep_alive=30,
+    logger.info("Linux 无界面模式启动，目录=%s，版本=%s", APP_DIR, BUILD_VERSION)
+
+    monitor_thread = threading.Thread(
+        target=SERVER_MANAGER.monitor_loop,
+        name="server-monitor",
+        daemon=True,
     )
+    monitor_thread.start()
+
+    started = SERVER_MANAGER.start()
+    if not started:
+        snapshot = SERVICE_STATE.snapshot()
+        logger.error("服务启动失败：%s", snapshot["detail"])
+        INSTANCE_GUARD.release()
+        return
+
+    addresses = detect_local_ipv4_addresses()
+    logger.info("接口已启动：http://0.0.0.0:%s/api/v1/optimize", API_PORT)
+    for ip in addresses:
+        logger.info("可访问地址：http://%s:%s/api/v1/optimize", ip, API_PORT)
+
+    # systemd 默认使用 SIGTERM；终端 Ctrl+C 为 SIGINT。
+    signal.signal(signal.SIGTERM, _linux_signal_handler)
+    signal.signal(signal.SIGINT, _linux_signal_handler)
+
+    try:
+        while not _LINUX_SHUTDOWN_EVENT.is_set():
+            thread = SERVER_MANAGER.server_thread
+            if thread is None or not thread.is_alive():
+                break
+            time.sleep(0.5)
+    finally:
+        SERVER_MANAGER.shutdown_monitor()
+        try:
+            SERVER_MANAGER.stop()
+        except Exception:
+            logger.exception("停止服务时发生异常")
+        INSTANCE_GUARD.release()
+        logger.info("Linux 服务已退出")
 
 
 if __name__ == "__main__":
