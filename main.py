@@ -38,7 +38,7 @@ STATUS_POLL_MS = 1000
 SERVER_MONITOR_INTERVAL = 5.0
 MAX_ALGO_WORKERS = 4
 REQUEST_TIMEOUT_SECONDS = None  # 兼容保留：接口已取消固定超时，不参与运行
-BUILD_VERSION = "2026-08-03-linux-v7-capacity-cache"
+BUILD_VERSION = "2026-08-04-linux-v8-deploy-verified"
 
 # 车辆换长均衡参数：只作为启发式目标，不替代任何硬约束。
 # 目标：尽可能少用车，并让已使用车辆的换长尽量贴近最大换长，避免出现明显低换长尾车。
