@@ -38,14 +38,20 @@ STATUS_POLL_MS = 1000
 SERVER_MONITOR_INTERVAL = 5.0
 MAX_ALGO_WORKERS = 4
 REQUEST_TIMEOUT_SECONDS = None  # 兼容保留：接口已取消固定超时，不参与运行
-BUILD_VERSION = "2026-08-25-linux-v11-seat-demand-balance"
+BUILD_VERSION = "2026-08-26-linux-v12-fast-safe-balance"
 
 # 车辆换长均衡参数：只作为启发式目标，不替代任何硬约束。
 # 目标：尽可能少用车，并让已使用车辆的换长尽量贴近最大换长，避免出现明显低换长尾车。
 BALANCE_MIN_LENGTH_RATIO = 0.88
 BALANCE_TARGET_LENGTH_RATIO = 0.96
 BALANCE_MAX_GAP_RATIO = 0.10
-BALANCE_MAX_ITERATIONS = 1400
+BALANCE_MAX_ITERATIONS = 320
+
+# 车辆层均衡只是软目标，任何时刻停止都不会破坏已经构造完成的硬约束方案。
+# 大规模数据下限制纯 Python 邻域搜索的总耗时，避免为少量换长改善反复扫描全部车辆。
+# 精确 MILP 可行性兜底不受该预算限制，仍负责处理启发式边界失败。
+BALANCE_MAX_ROUNDS = 2
+BALANCE_TIME_BUDGET_SECONDS = 8.0
 
 # 公司分散度软惩罚：避免为了补换长把同一公司拆散到过多车辆。
 # 该项只参与候选方案评分，不改变人-物同车、超重、超换长、yingjiName等硬约束。
@@ -2880,6 +2886,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         def compact_vehicles(vehicles):
             changed = True
             while changed:
+                if balance_budget_exhausted():
+                    break
                 changed = False
                 order = sorted(
                     range(len(vehicles)),
@@ -2887,6 +2895,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                                   max_weight_per_sc, max_length_per_sc), len(vehicles[i].units))
                 )
                 for source_idx in order:
+                    if balance_budget_exhausted():
+                        return vehicles
                     if source_idx >= len(vehicles):
                         continue
                     source_units = sorted(
@@ -3079,7 +3089,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 return affected
 
             def penalties(self, candidate, affected):
-                # 按原company_name插入顺序累加，确保评分计算顺序与原函数一致。
+                # 候选搬移只会影响 donor/receiver 中出现的公司。
+                # 直接在本轮基准总分上做差量替换，避免每个候选都遍历全部公司。
                 replacement_people = {}
                 replacement_spread = {}
                 for cid0 in affected:
@@ -3089,11 +3100,12 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     replacement_people[cid0] = _people_penalty_for_counts(counts)
                     vehicle_count = sum(1 for v in candidate if cid0 in v.companies)
                     replacement_spread[cid0] = (vehicle_count - 1) ** 2 if vehicle_count > 1 else 0.0
-                people_total = 0.0
-                spread_total = 0.0
-                for cid0 in self.company_order:
-                    people_total += replacement_people.get(cid0, self.people_contrib[cid0])
-                    spread_total += replacement_spread.get(cid0, self.spread_contrib[cid0])
+                people_total = self.people_total
+                spread_total = self.spread_total
+                for cid0, new_value in replacement_people.items():
+                    people_total += new_value - self.people_contrib[cid0]
+                for cid0, new_value in replacement_spread.items():
+                    spread_total += new_value - self.spread_contrib[cid0]
                 return people_total, spread_total
 
             def objective(self, candidate, affected):
@@ -3111,6 +3123,13 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             candidate[receiver_idx] = vehicle_list[receiver_idx].clone()
             return candidate
 
+        # 从车辆软均衡开始计时。超时只停止软目标改善，不会跳过任何硬校验。
+        balance_started_at = time.monotonic()
+        balance_deadline = balance_started_at + BALANCE_TIME_BUDGET_SECONDS
+
+        def balance_budget_exhausted():
+            return time.monotonic() >= balance_deadline
+
         def balance_vehicles_by_unit_moves(vehicle_list):
             """车辆层换长均衡后处理。
 
@@ -3126,23 +3145,25 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 return vehicles_local
 
             base_vehicle_validity = []
+            base_all_valid = True
 
             def valid_after_move(candidate, donor_idx, receiver_idx):
-                # 本候选只改变供给车和接收车；其余车辆复用本轮开始时的相同硬校验结果。
-                for vi, vehicle in enumerate(candidate):
-                    if not vehicle.units:
-                        continue
-                    if vi == donor_idx or vi == receiver_idx:
-                        if not vehicle_respects_person_nonperson_rule(vehicle):
-                            return False
-                    elif not base_vehicle_validity[vi]:
+                # 本候选只改变两辆车；未变车辆不再每个候选重复遍历校验。
+                if not base_all_valid:
+                    return False
+                for vi in {donor_idx, receiver_idx}:
+                    vehicle = candidate[vi]
+                    if vehicle.units and not vehicle_respects_person_nonperson_rule(vehicle):
                         return False
                 return True
 
             current_score = overall_balance_objective(vehicles_local)
             for _ in range(BALANCE_MAX_ITERATIONS):
+                if balance_budget_exhausted():
+                    break
                 objective_cache = _ObjectiveIterationCache(vehicles_local)
                 base_vehicle_validity = [vehicle_respects_person_nonperson_rule(v) for v in vehicles_local]
+                base_all_valid = all(base_vehicle_validity)
                 best = None
                 best_score = current_score
                 under_order = sorted(
@@ -3155,6 +3176,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 move_options_cache = {}
 
                 for receiver_idx in under_order:
+                    if balance_budget_exhausted():
+                        return vehicles_local
                     receiver = vehicles_local[receiver_idx]
                     # 低于目标下限，或全局最大/最小换长差距过大时才主动补车。
                     need_fill = (
@@ -3167,6 +3190,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     # 两轮候选：先同公司，再其他公司。
                     for prefer_same_company in (True, False):
                         for donor_idx, donor in enumerate(vehicles_local):
+                            if balance_budget_exhausted():
+                                return vehicles_local
                             if donor_idx == receiver_idx or donor.length <= receiver.length + 1e-6:
                                 continue
                             donor_units = donor_units_cache.get(donor_idx)
@@ -3299,15 +3324,14 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 return vehicles_local
 
             base_vehicle_validity = []
+            base_all_valid = True
 
             def valid_after_move(candidate, donor_idx, receiver_idx):
-                for vi, vehicle in enumerate(candidate):
-                    if not vehicle.units:
-                        continue
-                    if vi == donor_idx or vi == receiver_idx:
-                        if not vehicle_respects_person_nonperson_rule(vehicle):
-                            return False
-                    elif not base_vehicle_validity[vi]:
+                if not base_all_valid:
+                    return False
+                for vi in {donor_idx, receiver_idx}:
+                    vehicle = candidate[vi]
+                    if vehicle.units and not vehicle_respects_person_nonperson_rule(vehicle):
                         return False
                 return True
 
@@ -3330,13 +3354,18 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
             current_score = overall_balance_objective(vehicles_local)
             for _ in range(BALANCE_MAX_ITERATIONS):
+                if balance_budget_exhausted():
+                    break
                 objective_cache = _ObjectiveIterationCache(vehicles_local)
                 base_vehicle_validity = [vehicle_respects_person_nonperson_rule(v) for v in vehicles_local]
+                base_all_valid = all(base_vehicle_validity)
                 best = None
                 best_score = current_score
                 current_people_penalty = objective_cache.people_total
 
                 for cid0 in company_name.keys():
+                    if balance_budget_exhausted():
+                        return vehicles_local
                     counts = company_vehicle_counts(vehicles_local, cid0)
                     if not people_gap_needs_fix(counts):
                         continue
@@ -3424,7 +3453,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         # 多轮执行“压缩车辆数 -> 换长均衡 -> 公司人员均衡”。
         # 先尽量少用车，再在不增加车辆数、不破坏硬约束的前提下把尾车换长补起来。
         last_signature = None
-        for _balance_round in range(6):
+        for _balance_round in range(BALANCE_MAX_ROUNDS):
+            if balance_budget_exhausted():
+                break
             vehicles = compact_vehicles(vehicles)
             vehicles = balance_vehicles_by_unit_moves(vehicles)
             vehicles = balance_company_people_distribution(vehicles)
@@ -3438,12 +3469,18 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             last_signature = signature
         # 均衡后再尝试一次压缩；如压缩成功，再做一次均衡，避免新尾车过小。
         before_count = len(vehicles)
-        vehicles = compact_vehicles(vehicles)
-        if len(vehicles) < before_count:
+        if not balance_budget_exhausted():
+            vehicles = compact_vehicles(vehicles)
+        if len(vehicles) < before_count and not balance_budget_exhausted():
             vehicles = balance_vehicles_by_unit_moves(vehicles)
             vehicles = balance_company_people_distribution(vehicles)
         total_sc_used = len(vehicles)
-        print(f"启发式装车完成，使用 SC 总数: {total_sc_used}")
+        balance_elapsed = time.monotonic() - balance_started_at
+        budget_note = '（已达软均衡时间预算）' if balance_budget_exhausted() else ''
+        print(
+            f"启发式装车完成，使用 SC 总数: {total_sc_used}，"
+            f"车辆软均衡耗时: {balance_elapsed:.3f}秒{budget_note}"
+        )
         if vehicles:
             lengths_after_balance = [round(v.length, 2) for v in vehicles]
             print(f"车辆换长均衡结果: min={min(lengths_after_balance):.2f}, max={max(lengths_after_balance):.2f}, values={lengths_after_balance}")
