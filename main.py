@@ -38,7 +38,7 @@ STATUS_POLL_MS = 1000
 SERVER_MONITOR_INTERVAL = 5.0
 MAX_ALGO_WORKERS = 4
 REQUEST_TIMEOUT_SECONDS = None  # 兼容保留：接口已取消固定超时，不参与运行
-BUILD_VERSION = "2026-08-04-linux-v8-deploy-verified"
+BUILD_VERSION = "2026-08-25-linux-v11-seat-demand-balance"
 
 # 车辆换长均衡参数：只作为启发式目标，不替代任何硬约束。
 # 目标：尽可能少用车，并让已使用车辆的换长尽量贴近最大换长，避免出现明显低换长尾车。
@@ -276,6 +276,10 @@ class SubContainer:
             return False
         # 人员的装箱逻辑：按件数或载物比例
         else:
+            # 人员箱严禁跨公司混装。公司唯一性始终以 organizationID/company_id 判断，
+            # 不能用 organizationName 或 yingjiName 代替。
+            if get_public_box_type(self.box_type) == 'Person' and self.owners and company_id not in self.owners:
+                return False
             if self.current_load + item_load_value <= self.max_capacity + 1e-6:
                 self.current_load += item_load_value
                 self.weight += float(item_weight)
@@ -1373,8 +1377,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         def clone_person_box_with_count(src_box, count):
             """按给定人数拆出一个新的人员箱。
 
-            为满足“同一公司有人又有物时，每个装车单元必须人-物同车”的硬规则，
-            必要时允许把原本一个满载人员箱拆成多个同型号人员箱，并把人员数量分摊进去。
+            为满足“最终SC有某公司物资/装备时必须有该公司人员”的硬规则，
+            必要时允许把原本一个满载人员箱拆成多个同公司、同型号人员箱，并分摊人数。
             拆分会增加人员箱自重和换长，后续仍按超重/超换长硬约束校验。
             """
             count = int(count)
@@ -1406,13 +1410,227 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             return new_box
 
         def split_person_boxes_for_hard_balance():
-            """为人-物同车硬规则准备足够细粒度的人员箱。
+            """按预计SC需求为同一公司重分配人员箱。
 
-            如果某公司同时存在人员和物资/装备，而其总量至少需要多辆车，
-            但人员箱数量少于理论最少装车单元数，则把已有人员箱按人数拆成更多同型号人员箱。
-            这样后续每个装车单元才有机会至少配到一个人员箱。
+            保留既有人员车型规则：leiXing先决定软卧/硬卧/硬座人数，绝不跨公司混箱，
+            也不在不同箱型之间转移人数。软卧、硬卧仍按原顺序依次装满，只有最终确实
+            缺少同公司人员箱时才拆分；硬座人员可按预计SC需求在硬座箱之间均衡分配。
+
+            这里仍只生成候选人员箱；最终硬规则在SC层校验：某SC若有某公司的
+            物资/装备，该SC必须同时有该公司的人员。
             """
             nonlocal original_boxes
+
+            def estimated_vehicle_count(indices):
+                """用二维Best-Fit-Decreasing估计这些箱子实际需要的SC数。
+
+                总重量/总换长的ceil只是理论下界，边界数据受单箱不可再拆影响时可能偏小；
+                增加这一等价可行装箱估计，可提前准备足够的同公司人员箱。
+                """
+                bins = []
+                ordered = sorted(
+                    indices,
+                    key=lambda i: dominant_ratio(
+                        original_boxes[i].weight,
+                        original_boxes[i].length_unit,
+                        max_weight_per_sc,
+                        max_length_per_sc,
+                    ),
+                    reverse=True,
+                )
+                for idx0 in ordered:
+                    box0 = original_boxes[idx0]
+                    best_pos = None
+                    best_score = None
+                    for pos, (used_w, used_l) in enumerate(bins):
+                        new_w = used_w + box0.weight
+                        new_l = used_l + box0.length_unit
+                        if new_w > max_weight_per_sc + 1e-6 or new_l > max_length_per_sc + 1e-6:
+                            continue
+                        # 放入后越满越优先，减少理论下界低估造成的人员箱数量不足。
+                        score = dominant_ratio(new_w, new_l, max_weight_per_sc, max_length_per_sc)
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_pos = pos
+                    if best_pos is None:
+                        bins.append((box0.weight, box0.length_unit))
+                    else:
+                        used_w, used_l = bins[best_pos]
+                        bins[best_pos] = (used_w + box0.weight, used_l + box0.length_unit)
+                return max(1, len(bins))
+
+            def estimated_material_vehicle_count(person_indices0, non_person_indices0):
+                """估计承载物资/装备的SC数，并为每辆预留一个同公司人员箱。
+
+                与单纯按总换长取ceil不同，这能识别“两个物资箱可以同车，但再放人员箱
+                就超限”的边界情形，避免人员箱准备数量仍然偏少。
+                """
+                reserve_idx = min(
+                    person_indices0,
+                    key=lambda i: dominant_ratio(
+                        original_boxes[i].weight,
+                        original_boxes[i].length_unit,
+                        max_weight_per_sc,
+                        max_length_per_sc,
+                    ),
+                )
+                reserve_box = original_boxes[reserve_idx]
+                usable_weight = max_weight_per_sc - reserve_box.weight
+                usable_length = max_length_per_sc - reserve_box.length_unit
+                if usable_weight < -1e-6 or usable_length < -1e-6:
+                    return len(non_person_indices0) + 1
+
+                bins = []
+                ordered = sorted(
+                    non_person_indices0,
+                    key=lambda i: dominant_ratio(
+                        original_boxes[i].weight,
+                        original_boxes[i].length_unit,
+                        max(usable_weight, 1e-9),
+                        max(usable_length, 1e-9),
+                    ),
+                    reverse=True,
+                )
+                for idx0 in ordered:
+                    box0 = original_boxes[idx0]
+                    if box0.weight > usable_weight + 1e-6 or box0.length_unit > usable_length + 1e-6:
+                        # 该物资/装备箱连同当前最小占用人员箱也无法同车。
+                        return len(non_person_indices0) + 1
+                    best_pos = None
+                    best_score = None
+                    for pos, (used_w, used_l) in enumerate(bins):
+                        new_w = used_w + box0.weight
+                        new_l = used_l + box0.length_unit
+                        if new_w > usable_weight + 1e-6 or new_l > usable_length + 1e-6:
+                            continue
+                        score = dominant_ratio(
+                            new_w,
+                            new_l,
+                            max(usable_weight, 1e-9),
+                            max(usable_length, 1e-9),
+                        )
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_pos = pos
+                    if best_pos is None:
+                        bins.append((box0.weight, box0.length_unit))
+                    else:
+                        used_w, used_l = bins[best_pos]
+                        bins[best_pos] = (used_w + box0.weight, used_l + box0.length_unit)
+                return max(1, len(bins))
+
+            def person_spec_key(box):
+                count0 = person_count_in_box(box)
+                empty_weight0 = max(0.0, float(box.weight) - count0 * float(person_weight))
+                return (
+                    str(box.box_type),
+                    str(getattr(box, 'zzsbid', '')),
+                    str(getattr(box, 'zhuang_zai', '')),
+                    round(float(box.length_unit), 9),
+                    round(empty_weight0, 6),
+                    int(box.max_capacity),
+                    str(box.capacity_type),
+                )
+
+            def balanced_counts(total_count, box_count):
+                base, extra = divmod(int(total_count), int(box_count))
+                return [base + (1 if i < extra else 0) for i in range(box_count)]
+
+            def rebuild_company_person_boxes(cid0, person_idxs, target_count):
+                """按业务优先级重建人员箱，同时保持各箱型总人数不变。
+
+                - 硬座：允许按需求均分，并优先承担新增人员箱需求；
+                - 硬卧/软卧：正常情况下保持原来的依次装满结果；只有人员箱数量不足时，
+                  才从该箱型人数最多的箱开始二分，不主动参与均衡；
+                - 任意情况下均不跨公司、跨人员箱型转移人员。
+                """
+                grouped = defaultdict(list)
+                for idx0 in person_idxs:
+                    grouped[person_spec_key(original_boxes[idx0])].append(idx0)
+
+                group_infos = []
+                for key0, idxs0 in grouped.items():
+                    idxs0 = sorted(idxs0)
+                    total0 = sum(person_count_in_box(original_boxes[i]) for i in idxs0)
+                    group_infos.append({
+                        'key': key0,
+                        'indices': idxs0,
+                        'template': original_boxes[idxs0[0]],
+                        'zhuang_zai': str(getattr(original_boxes[idxs0[0]], 'zhuang_zai', '')).strip(),
+                        'total': total0,
+                        'boxes': len(idxs0),
+                    })
+                group_infos.sort(key=lambda info: info['indices'][0])
+
+                allocated = [info['boxes'] for info in group_infos]
+                while sum(allocated) < target_count:
+                    # 新增人员箱优先使用硬座；硬座确实无法继续拆时，才依次拆硬卧、软卧。
+                    candidates = []
+                    for zhuang_zai0 in ('硬座', '硬卧', '软卧'):
+                        candidates = [
+                            pos for pos, info in enumerate(group_infos)
+                            if info['zhuang_zai'] == zhuang_zai0 and info['total'] > allocated[pos]
+                        ]
+                        if candidates:
+                            break
+                    if not candidates:
+                        candidates = [
+                            pos for pos, info in enumerate(group_infos)
+                            if info['total'] > allocated[pos]
+                        ]
+                    if not candidates:
+                        raise AlgorithmError(
+                            f'公司 {company_name.get(cid0, cid0)}({cid0}) 人员不足，'
+                            f'无法生成{target_count}个非空且不跨公司的人员箱'
+                        )
+                    # 同一优先级内选择当前平均人数最多的箱型。
+                    chosen = max(
+                        candidates,
+                        key=lambda pos: group_infos[pos]['total'] / max(1, allocated[pos]),
+                    )
+                    allocated[chosen] += 1
+
+                rebuilt = []
+                desired_signature = []
+                current_signature = []
+                for pos, info in enumerate(group_infos):
+                    current = [person_count_in_box(original_boxes[i]) for i in info['indices']]
+                    if info['zhuang_zai'] == '硬座':
+                        # 只有硬座主动按最终需求均分。
+                        desired = balanced_counts(info['total'], allocated[pos])
+                    else:
+                        # 软卧/硬卧保持依次装满；只有箱数不足时才拆人数最多的现有箱。
+                        desired = list(current)
+                        while len(desired) < allocated[pos]:
+                            split_pos = max(range(len(desired)), key=lambda i: desired[i])
+                            split_count = desired[split_pos]
+                            if split_count < 2:
+                                raise AlgorithmError(
+                                    f'公司 {company_name.get(cid0, cid0)}({cid0}) 的{info["zhuang_zai"] or "人员"}箱'
+                                    f'无法继续拆分为非空人员箱'
+                                )
+                            left = split_count // 2
+                            right = split_count - left
+                            desired[split_pos] = left
+                            desired.append(right)
+                    desired_signature.append((info['key'], tuple(desired)))
+                    current_signature.append((info['key'], tuple(current)))
+                    for count0 in desired:
+                        rebuilt.append(clone_person_box_with_count(info['template'], count0))
+
+                if desired_signature == current_signature:
+                    return False
+
+                remove_set = set(person_idxs)
+                insert_at = min(person_idxs)
+                new_original = []
+                for idx0, box0 in enumerate(original_boxes):
+                    if idx0 == insert_at:
+                        new_original.extend(rebuilt)
+                    if idx0 not in remove_set:
+                        new_original.append(box0)
+                original_boxes[:] = new_original
+                return True
 
             def company_presence():
                 presence = defaultdict(lambda: {'person': [], 'non_person': []})
@@ -1437,7 +1655,12 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 for cid0, parts in presence.items():
                     person_idxs = parts['person']
                     non_person_idxs = parts['non_person']
-                    if not person_idxs or not non_person_idxs:
+                    if non_person_idxs and not person_idxs:
+                        raise AlgorithmError(
+                            f'公司 {company_name.get(cid0, cid0)}({cid0}) 存在物资/装备但人员数为0，'
+                            f'无法满足“含该公司物资/装备的SC必须有该公司人员”规则'
+                        )
+                    if not non_person_idxs:
                         continue
 
                     all_idxs = person_idxs + non_person_idxs
@@ -1445,35 +1668,32 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     total_l = sum(original_boxes[i].length_unit for i in all_idxs)
                     required_by_weight = int(math.ceil(total_w / max_weight_per_sc)) if max_weight_per_sc > 0 else 1
                     required_by_length = int(math.ceil(total_l / max_length_per_sc)) if max_length_per_sc > 0 else 1
-                    required_units = max(1, required_by_weight, required_by_length)
-
-                    if len(person_idxs) >= required_units:
-                        continue
+                    required_by_packing = estimated_vehicle_count(all_idxs)
+                    required_by_material = estimated_material_vehicle_count(person_idxs, non_person_idxs)
+                    if required_by_material > len(non_person_idxs):
+                        raise AlgorithmError(
+                            f'公司 {company_name.get(cid0, cid0)}({cid0}) 存在单个物资/装备箱无法与任何'
+                            f'该公司人员箱在不超重、不超换长条件下同车的情况'
+                        )
+                    required_units = max(
+                        1,
+                        required_by_weight,
+                        required_by_length,
+                        required_by_packing,
+                        required_by_material,
+                    )
 
                     total_people = sum(person_count_in_box(original_boxes[i]) for i in person_idxs)
                     if total_people < required_units:
                         raise AlgorithmError(
                             f'公司 {company_name.get(cid0, cid0)}({cid0}) 同时存在人员和物资/装备，'
-                            f'至少需要{required_units}个装车单元，但人员总数只有{total_people}，'
-                            f'无法保证每个装车单元都至少有人'
+                            f'预计至少分布到{required_units}辆SC，但人员总数只有{total_people}，'
+                            f'无法保证每辆含该公司物资/装备的SC都至少有1名该公司人员'
                         )
-
-                    # 选择人数最多且可继续拆分的人员箱，一分为二。
-                    splittable = [i for i in person_idxs if person_count_in_box(original_boxes[i]) >= 2]
-                    if not splittable:
-                        raise AlgorithmError(
-                            f'公司 {company_name.get(cid0, cid0)}({cid0}) 人员箱数量不足且无法继续拆分，'
-                            f'无法满足每个装车单元人-物同车硬规则'
-                        )
-                    split_idx = max(splittable, key=lambda i: person_count_in_box(original_boxes[i]))
-                    src_box = original_boxes[split_idx]
-                    cnt = person_count_in_box(src_box)
-                    left = cnt // 2
-                    right = cnt - left
-                    original_boxes[split_idx] = clone_person_box_with_count(src_box, left)
-                    original_boxes.append(clone_person_box_with_count(src_box, right))
-                    changed = True
-                    break
+                    target_person_boxes = max(len(person_idxs), required_units)
+                    if rebuild_company_person_boxes(cid0, person_idxs, target_person_boxes):
+                        changed = True
+                        break
 
         split_person_boxes_for_hard_balance()
 
@@ -1687,9 +1907,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             - 若公司同时存在人员箱和物资/装备箱，不再先装完物资、最后再装人员；
             - 先按总重量/总换长估算该公司至少需要的车辆数；
             - 在这些目标车辆块之间分别均衡分摊“非人员箱”和“人员箱”；
-            - 硬性保证：只要该公司同时存在人员箱和物资/装备箱，则该公司形成的每个装车单元都必须同时含有人和物资/装备；
-            - 不允许出现该公司的纯人员装车单元或纯物资/装备装车单元；
-            - 若受单箱尺寸、超重、超换长等约束影响无法做到人-物同车，则直接报错，不输出违反规则的方案。
+            - 硬性保证：任何承载该公司物资/装备的最终SC都必须同时含该公司人员；
+            - 允许纯人员单元/纯人员SC，但不允许纯物资/装备SC；
+            - 若受单箱尺寸、超重、超换长等约束影响无法做到“有物必有人”，则直接报错。
             """
             def can_add_to_chunk(chunk, box_idx):
                 b = all_sub_containers[box_idx]
@@ -1791,9 +2011,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             def rebalance_single_type_chunks(chunks):
                 """尝试修复只含人员或只含物资/装备的块。
 
-                现在“不能出现纯人员块/纯物资装备块”是硬规则：
+                尝试修复单一类型块：
                 - 能通过搬移箱子修复，则返回修复后的块；
-                - 不能修复，则后续 assert_no_single_type_chunks 会报错，禁止输出违规方案。
+                - 纯人员块允许保留；纯物资/装备块不能修复时由后续硬校验报错。
                 """
                 changed = True
                 while changed:
@@ -1864,15 +2084,17 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 return [c for c in chunks if c.get('box_indices')]
 
             def assert_no_single_type_chunks(chunks):
-                """硬校验：同一公司同时有人和物资/装备时，不允许产生纯人员或纯物资/装备装车单元。"""
+                """硬校验：只禁止纯物资/装备单元；纯人员单元允许存在。
+
+                业务规则是单向蕴含：某SC有该公司物资/装备 => 同SC有该公司人员。
+                人员单独成单元或最终形成纯人员SC不违反该规则。
+                """
                 violations = []
                 for k, chunk in enumerate(chunks):
                     load = chunk_person_nonperson_load(chunk)
                     has_person = load['person_count'] > 0
                     has_non_person = load['non_person_count'] > 0
-                    if has_person and not has_non_person:
-                        violations.append((k + 1, '纯人员'))
-                    elif has_non_person and not has_person:
+                    if has_non_person and not has_person:
                         violations.append((k + 1, '纯物资/装备'))
                 if violations:
                     detail = '；'.join([f'第{idx}个装车单元为{kind}单元' for idx, kind in violations[:10]])
@@ -1880,25 +2102,25 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         detail += f'；另有{len(violations) - 10}个违规单元'
                     raise AlgorithmError(
                         f'公司 {company_name.get(cid, cid)}({cid}) 同时存在人员和物资/装备，'
-                        f'但无法在不超重、不超换长的前提下实现每个装车单元人-物同车：{detail}'
+                        f'但无法在不超重、不超换长的前提下保证含物资/装备的单元都有该公司人员：{detail}'
                     )
 
             def pack_company_balanced(person_indices, non_person_indices):
                 """公司内人员-物资均衡打包：适用于同时有人员和物资/装备的公司。
 
-                这里把“不能产生纯人员/纯物资装备装车单元”作为硬规则：
-                - 每个候选装车单元先至少放入一个非人员箱和一个人员箱；
-                - 后续剩余箱子只允许继续加入已有混合单元，不再新建纯类型单元；
-                - 如果现有箱子粒度与容量约束导致无法满足，则直接报错。
+                快速路径优先构造人-物混合单元；如果剩余人员不能全部放入混合单元，
+                后续精确兜底允许形成纯人员单元，但始终禁止纯物资/装备单元。
                 """
                 all_indices = list(person_indices) + list(non_person_indices)
                 lower_count = lower_bound_vehicle_count(all_indices)
-                max_mixed_count = min(len(person_indices), len(non_person_indices))
+                # 每个最终块至少需要一个本公司人员箱；允许其中部分块为纯人员块。
+                # 因此最大可用块数由人员箱数决定，而不是由物资/装备箱数决定。
+                max_mixed_count = len(person_indices)
                 if lower_count > max_mixed_count:
                     raise AlgorithmError(
                         f'公司 {company_name.get(cid, cid)}({cid}) 同时存在人员和物资/装备，'
-                        f'但至少需要{lower_count}个装车单元，而当前人员箱数={len(person_indices)}、'
-                        f'物资/装备箱数={len(non_person_indices)}，无法保证每个装车单元都人-物同车'
+                        f'预计至少需要{lower_count}辆SC，但当前只有{len(person_indices)}个同公司人员箱，'
+                        f'无法保证每辆含该公司物资/装备的SC都有该公司人员'
                     )
 
                 chao_indices = [i for i in non_person_indices if box_has_chaoxian_equipment(all_sub_containers[i])]
@@ -1934,7 +2156,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     本轮修正重点：
                     - 先把非人员箱分摊好，再按非人员负载比例分配人员箱；
                     - 避免某个单元只有一个物资/装备箱，却被分到大量人员；
-                    - 仍保持硬规则：最终每个单元必须同时有人和物资/装备。
+                    - 快速路径仍优先让每个目标块同时有人和物；精确兜底可保留纯人员块。
                     """
                     chunks = [make_empty_chunk() for _ in range(target_count)]
 
@@ -2351,6 +2573,159 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     extra_count_penalty = 0.35 * max(0, len(chunks) - lower_count) * (max_length_per_sc ** 2)
                     return 2.20 * under_penalty + 0.85 * target_gap + 0.55 * range_penalty + 0.05 * weight_range + extra_count_penalty
 
+                def build_exact_with_target_count(target_count):
+                    """用 MILP 精确寻找指定装车单元数的可行分配。
+
+                    正常数据仍先走上面的快速启发式；只有所有启发式排序都失败时才调用本函数。
+                    与启发式不同，这里同时决定所有箱子的去向，所以不会因为前面某个箱子的
+                    局部贪心选择，导致后面的箱子在临界最大换长下被误判为无解。
+
+                    模型只表达现有硬规则，不改变装车规则或接口：
+                    1. 每个箱子恰好进入一个装车单元；
+                    2. 每个单元不超重、不超换长；
+                    3. 每个单元至少有一个本公司人员箱；允许纯人员单元；
+                    4. 任何含物资/装备的单元因此必然同时含本公司人员。
+                    """
+                    try:
+                        import numpy as np
+                        from scipy.optimize import Bounds, LinearConstraint, milp
+                        from scipy.sparse import coo_matrix
+                    except Exception as exc:
+                        raise AlgorithmError(
+                            '精确可行性兜底需要 scipy（含 scipy.optimize.milp）；'
+                            '请在运行/打包环境安装 scipy>=1.9'
+                        ) from exc
+
+                    exact_indices = list(person_indices) + list(non_person_indices)
+                    box_count = len(exact_indices)
+                    variable_count = box_count * target_count
+                    if box_count == 0 or target_count <= 0:
+                        return None, '精确求解收到空箱集合或非法装车单元数'
+
+                    weights = np.asarray(
+                        [float(all_sub_containers[i].weight) for i in exact_indices], dtype=float
+                    )
+                    lengths = np.asarray(
+                        [float(all_sub_containers[i].length_unit) for i in exact_indices], dtype=float
+                    )
+                    is_person = np.asarray(
+                        [1.0 if get_public_box_type(all_sub_containers[i].box_type) == 'Person' else 0.0
+                         for i in exact_indices],
+                        dtype=float,
+                    )
+                    is_non_person = 1.0 - is_person
+
+                    row_indices = []
+                    col_indices = []
+                    coefficients = []
+                    lower_bounds = []
+                    upper_bounds = []
+                    row = 0
+
+                    def add_row(entries, lower, upper):
+                        nonlocal row
+                        for col, value in entries:
+                            if abs(value) > 1e-12:
+                                row_indices.append(row)
+                                col_indices.append(col)
+                                coefficients.append(float(value))
+                        lower_bounds.append(float(lower))
+                        upper_bounds.append(float(upper))
+                        row += 1
+
+                    # 每个箱子必须且只能分配一次。
+                    for i in range(box_count):
+                        add_row(((i * target_count + k, 1.0) for k in range(target_count)), 1.0, 1.0)
+
+                    # 每个装车单元的容量和人-物同车约束。
+                    for k in range(target_count):
+                        add_row(
+                            ((i * target_count + k, weights[i]) for i in range(box_count)),
+                            -np.inf,
+                            max_weight_per_sc,
+                        )
+                        add_row(
+                            ((i * target_count + k, lengths[i]) for i in range(box_count)),
+                            -np.inf,
+                            max_length_per_sc,
+                        )
+                        add_row(
+                            ((i * target_count + k, is_person[i]) for i in range(box_count)),
+                            1.0,
+                            np.inf,
+                        )
+                        # 不要求每个单元必须有物资/装备；纯人员单元符合业务规则。
+
+                    # 对称性消除：按总换长非增序排列装车单元。
+                    # 任意可行方案都可以按此顺序重编号，因此不会删掉真实可行解，
+                    # 但可显著减少完全相同车辆编号造成的搜索分支。
+                    for k in range(target_count - 1):
+                        add_row(
+                            (
+                                (i * target_count + kk, lengths[i] * sign)
+                                for i in range(box_count)
+                                for kk, sign in ((k, 1.0), (k + 1, -1.0))
+                            ),
+                            0.0,
+                            np.inf,
+                        )
+
+                    matrix = coo_matrix(
+                        (coefficients, (row_indices, col_indices)),
+                        shape=(row, variable_count),
+                    ).tocsr()
+
+                    # 目标函数恒为 0：这里只需第一组严格可行解，不额外消耗时间追求最优评分。
+                    # 常规方案质量仍由前面的启发式和后续车辆均衡处理负责。
+                    result = milp(
+                        c=np.zeros(variable_count, dtype=float),
+                        integrality=np.ones(variable_count, dtype=np.int8),
+                        bounds=Bounds(
+                            np.zeros(variable_count, dtype=float),
+                            np.ones(variable_count, dtype=float),
+                        ),
+                        constraints=LinearConstraint(
+                            matrix,
+                            np.asarray(lower_bounds, dtype=float),
+                            np.asarray(upper_bounds, dtype=float),
+                        ),
+                        options={
+                            'presolve': True,
+                            'mip_rel_gap': 0.0,
+                            'disp': False,
+                        },
+                    )
+
+                    if result.x is None:
+                        if getattr(result, 'status', None) == 2:
+                            return None, f'精确求解证明 target_count={target_count} 不可行'
+                        return None, (
+                            f'精确求解未返回方案：target_count={target_count}, '
+                            f'status={getattr(result, "status", "")}, '
+                            f'message={getattr(result, "message", "")}'
+                        )
+
+                    assignment = np.rint(np.asarray(result.x).reshape(box_count, target_count)).astype(int)
+                    if np.any(assignment.sum(axis=1) != 1):
+                        return None, f'精确求解结果完整性校验失败：target_count={target_count}'
+
+                    exact_chunks = []
+                    for k in range(target_count):
+                        selected = [exact_indices[i] for i in range(box_count) if assignment[i, k] == 1]
+                        if not selected:
+                            return None, f'精确求解产生空装车单元：target_count={target_count}, k={k}'
+                        chunk = make_unit(selected, forced_owners={cid})
+                        if (chunk['weight'] > max_weight_per_sc + 1e-6 or
+                                chunk['length'] > max_length_per_sc + 1e-6):
+                            return None, f'精确求解结果复核超限：target_count={target_count}, k={k}'
+                        exact_chunks.append(chunk)
+
+                    try:
+                        assert_no_single_type_chunks(exact_chunks)
+                    except AlgorithmError as exc:
+                        return None, f'精确求解结果人-物同车复核失败：{exc}'
+                    return exact_chunks, ''
+
                 best_chunks = None
                 best_score = None
                 best_target_count = None
@@ -2360,7 +2735,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 # 从理论下界开始尝试；如果为了满足人-物同车或均衡需要增加车辆数，则逐步增加。
                 # 不再遇到第一个可行方案就返回，避免45/55可行而50被局部贪心误判，
                 # 同时避免公司内部产生40、26这类明显不均衡的块。
-                for target_count in range(lower_count, max_mixed_count + 1):
+                heuristic_target_max = min(max_mixed_count, len(non_person_indices))
+                for target_count in range(lower_count, heuristic_target_max + 1):
                     for strategy_name, np_order, p_order in order_variant_list:
                         chunks, err = build_with_target_count(target_count, np_order, p_order)
                         if chunks is not None:
@@ -2382,6 +2758,22 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                 max_l - min_l <= max_length_per_sc * BALANCE_MAX_GAP_RATIO + 1e-6):
                             break
 
+                # 快速启发式全部失败后，再进行精确可行性兜底。
+                # 这是修复“改变最大换长偶尔就能运行”的关键：不再把贪心死路当成数学无解。
+                if best_chunks is None:
+                    exact_errors = []
+                    for target_count in range(lower_count, max_mixed_count + 1):
+                        exact_chunks, exact_error = build_exact_with_target_count(target_count)
+                        if exact_chunks is not None:
+                            best_chunks = exact_chunks
+                            best_target_count = target_count
+                            best_strategy = 'exact-milp-fallback'
+                            best_score = chunks_balance_score(exact_chunks)
+                            break
+                        exact_errors.append(exact_error)
+                    if exact_errors:
+                        last_error = '；'.join(exact_errors[-3:])
+
                 if best_chunks is not None:
                     print(
                         f"公司 {company_name.get(cid, cid)}({cid}) 人-物同车打包完成："
@@ -2392,7 +2784,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
                 raise AlgorithmError(
                     f'公司 {company_name.get(cid, cid)}({cid}) 同时存在人员和物资/装备，'
-                    f'但无法在不超重、不超换长的前提下实现每个装车单元人-物同车；'
+                    f'但无法在不超重、不超换长的前提下保证每辆含该公司物资/装备的SC都有该公司人员；'
                     f'最后一次失败原因：{last_error or "未知"}'
                 )
 
@@ -2529,19 +2921,20 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         presence[cid0]['person'] = True
                     else:
                         presence[cid0]['non_person'] = True
-            return {cid0 for cid0, flags in presence.items() if flags.get('person') and flags.get('non_person')}
+            # 业务规则是“有物必有人”，因此所有存在物资/装备的公司都需要校验。
+            return {cid0 for cid0, flags in presence.items() if flags.get('non_person')}
 
         companies_need_mixed_final = companies_requiring_person_nonperson_mix()
 
         def vehicle_respects_person_nonperson_rule(vehicle):
-            """搬移预检：任何涉及人-物同车硬规则的公司，在单车内不得只出现一种类型。"""
+            """搬移预检：单车有某公司物资/装备时，必须同时有该公司人员。"""
             person_owners = set()
             non_person_owners = set()
             for unit in vehicle.units:
                 person_owners.update(unit.get('_person_owners', set()))
                 non_person_owners.update(unit.get('_non_person_owners', set()))
-            for cid0 in person_owners | non_person_owners:
-                if cid0 in companies_need_mixed_final and ((cid0 in person_owners) != (cid0 in non_person_owners)):
+            for cid0 in non_person_owners:
+                if cid0 in companies_need_mixed_final and cid0 not in person_owners:
                     return False
             return True
 
@@ -3092,7 +3485,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         company_type_presence[cid0]['non_person'] = True
             companies_need_mixed = {
                 cid0 for cid0, flags in company_type_presence.items()
-                if flags.get('person') and flags.get('non_person')
+                if flags.get('non_person')
             }
 
             for v, vehicle in enumerate(vehicles):
@@ -3109,11 +3502,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 for cid0, flags in per_company_vehicle_presence.items():
                     if cid0 not in companies_need_mixed:
                         continue
-                    if flags.get('person') != flags.get('non_person'):
-                        only_type = '仅人员' if flags.get('person') else '仅物资/装备'
+                    if flags.get('non_person') and not flags.get('person'):
                         raise AlgorithmError(
                             f"SC_{v + 1:03d} 违反人-物同车硬规则：公司 {company_name.get(cid0, cid0)}({cid0}) "
-                            f"在该车中为{only_type}，但该公司全局同时存在人员和物资/装备"
+                            f"在该车中有物资/装备但没有该公司人员"
                         )
 
             spread = defaultdict(set)
@@ -3468,6 +3860,23 @@ def validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max
                 raise AlgorithmError(f"{sid} 存在单箱超换长: box_id={box.get('box_id')}")
             for cid in box.get('owners', []) or []:
                 owners_from_boxes.add(cid)
+
+            # 人员箱不得跨公司混装；允许同一SC存在多个公司的独立人员箱。
+            if get_public_box_type(box.get('box_type', '')) == 'Person':
+                person_company_ids = {
+                    str(entity.get('company_id', '')).strip()
+                    for entity in (box.get('content_desc', []) or [])
+                    if isinstance(entity, dict) and entity.get('type') == 'person'
+                    and str(entity.get('company_id', '')).strip()
+                }
+                person_owner_ids = {
+                    str(cid).strip() for cid in (box.get('owners', []) or []) if str(cid).strip()
+                }
+                if len(person_company_ids) > 1 or len(person_owner_ids) > 1:
+                    raise AlgorithmError(
+                        f"{sid} 人员箱跨公司混装: box_id={box.get('box_id')}, "
+                        f"company_ids={sorted(person_company_ids | person_owner_ids)}"
+                    )
 
             # Small箱内再次校验 zjdh 混装规则，确保不会输出矩阵禁止的混装组合。
             goods_entities = [
