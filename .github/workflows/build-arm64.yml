@@ -7,6 +7,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -16,28 +17,59 @@ jobs:
 
       - name: Build in official ARM64 Python container
         run: |
-          docker run --rm -v ${{ github.workspace }}:/ws -w /ws arm64v8/python:3.10-buster /bin/bash -c "
-            set -e
-            apt-get update && apt-get install -y binutils gcc g++ make zlib1g-dev
-            pip install --upgrade pip
-            pip install -r requirements_linux.txt
-            pip install pyinstaller --no-binary pyinstaller
+          docker run --rm \
+            -v ${{ github.workspace }}:/ws \
+            -w /ws \
+            arm64v8/python:3.10-buster \
+            /bin/bash -c "
+              set -e
 
-            pyinstaller --onefile --clean \
-                        --collect-all uvicorn \
-                        --collect-all fastapi \
-                        --collect-all pydantic \
-                        --hidden-import=uvicorn.logging \
-                        --hidden-import=uvicorn.loops.auto \
-                        --hidden-import=uvicorn.protocols.http.auto \
-                        --hidden-import=uvicorn.lifespan.on \
-                        --name railway_app_arm64 main.py
+              apt-get update
+              apt-get install -y binutils gcc g++ make zlib1g-dev
 
-            chmod -R 777 dist/
-          "
+              pip install --upgrade pip
+              pip install -r requirements_linux.txt
+              pip install pyinstaller --no-binary pyinstaller
 
-      - name: Upload Finished Binary
+              echo '===== Dependency Check ====='
+              python -m py_compile main.py
+              python -c \"import numpy; print('numpy =', numpy.__version__)\"
+              python -c \"import scipy; print('scipy =', scipy.__version__)\"
+              python -c \"from scipy.optimize import milp; print('scipy.optimize.milp = OK')\"
+
+              echo '===== Build Version ====='
+              grep -n BUILD_VERSION main.py
+
+              echo '===== Source SHA256 ====='
+              sha256sum main.py
+
+              echo '===== PyInstaller Build ====='
+              pyinstaller --onedir --clean \
+                          --collect-all scipy \
+                          --collect-all uvicorn \
+                          --collect-all fastapi \
+                          --collect-all pydantic \
+                          --hidden-import=uvicorn.logging \
+                          --hidden-import=uvicorn.loops.auto \
+                          --hidden-import=uvicorn.protocols.http.auto \
+                          --hidden-import=uvicorn.lifespan.on \
+                          --name railway_app_arm64 main.py
+
+              chmod -R 755 dist/railway_app_arm64
+
+              echo '===== Build Output ====='
+              ls -lah dist/railway_app_arm64
+              du -sh dist/railway_app_arm64
+
+              cd dist
+              tar -czf railway_app_arm64.tar.gz railway_app_arm64
+              cd ..
+
+              chmod 666 dist/railway_app_arm64.tar.gz
+            "
+
+      - name: Upload Finished ARM64 Package
         uses: actions/upload-artifact@v4
         with:
           name: railway-arm64-binary
-          path: dist/railway_app_arm64
+          path: dist/railway_app_arm64.tar.gz
