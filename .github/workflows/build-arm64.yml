@@ -18,32 +18,46 @@ jobs:
       - name: Build in official ARM64 Python container
         run: |
           docker run --rm \
+            --platform linux/arm64/v8 \
             -v ${{ github.workspace }}:/ws \
             -w /ws \
             arm64v8/python:3.10-buster \
             /bin/bash -c "
               set -e
 
+              echo '===== Switch Debian Buster to archive repositories ====='
+
+              printf 'deb http://archive.debian.org/debian buster main contrib non-free\n\
+          deb http://archive.debian.org/debian buster-updates main contrib non-free\n\
+          deb http://archive.debian.org/debian-security buster/updates main contrib non-free\n' \
+                > /etc/apt/sources.list
+
+              echo 'Acquire::Check-Valid-Until \"false\";' \
+                > /etc/apt/apt.conf.d/99archive
+
               apt-get update
               apt-get install -y binutils gcc g++ make zlib1g-dev
+
+              echo '===== Install Python Dependencies ====='
 
               pip install --upgrade pip
               pip install -r requirements_linux.txt
               pip install pyinstaller --no-binary pyinstaller
 
               echo '===== Dependency Check ====='
+
               python -m py_compile main.py
               python -c \"import numpy; print('numpy =', numpy.__version__)\"
               python -c \"import scipy; print('scipy =', scipy.__version__)\"
               python -c \"from scipy.optimize import milp; print('scipy.optimize.milp = OK')\"
 
               echo '===== Build Version ====='
-              grep -n BUILD_VERSION main.py
 
-              echo '===== Source SHA256 ====='
+              grep -n BUILD_VERSION main.py
               sha256sum main.py
 
               echo '===== PyInstaller Build ====='
+
               pyinstaller --onedir --clean \
                           --collect-all scipy \
                           --collect-all uvicorn \
@@ -58,6 +72,7 @@ jobs:
               chmod -R 755 dist/railway_app_arm64
 
               echo '===== Build Output ====='
+
               ls -lah dist/railway_app_arm64
               du -sh dist/railway_app_arm64
 
