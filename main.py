@@ -36,15 +36,25 @@ SERVER_START_TIMEOUT = 20.0
 SERVER_STOP_TIMEOUT = 10.0
 STATUS_POLL_MS = 1000
 SERVER_MONITOR_INTERVAL = 5.0
-MAX_ALGO_WORKERS = 4
+# 单次求解是 CPU/内存密集型；Linux 默认串行受理可避免四个万人级任务互相抢占。
+# 若部署机容量足够，可由运维显式设置 RAILWAY_ALGO_WORKERS=2..4 提高吞吐。
+MAX_ALGO_WORKERS = max(1, min(4, int(os.getenv('RAILWAY_ALGO_WORKERS', '1'))))
 REQUEST_TIMEOUT_SECONDS = None  # 兼容保留：接口已取消固定超时，不参与运行
-BUILD_VERSION = "2026-08-26-linux-v12-fast-safe-balance"
+BUILD_VERSION = "2026-09-03-linux-v14-fast-feasible"
+
+# 默认目标：尽快返回一组满足全部硬规则的可行解。下列换长、人数、公司分散度均为
+# 原代码已经声明的软目标；FAST_FEASIBLE_MODE 只停止这些软目标的反复择优，不跳过
+# 任何装箱限制、SC容量、yingjiName、人-物同车或最终输出校验。
+FAST_FEASIBLE_MODE = True
+FAST_COMPANY_BALANCE_SECONDS = 3.00
+FAST_LENGTH_BALANCE_SECONDS = 0.90
+FAST_PEOPLE_BALANCE_SECONDS = 0.60
 
 # 车辆换长均衡参数：只作为启发式目标，不替代任何硬约束。
 # 目标：尽可能少用车，并让已使用车辆的换长尽量贴近最大换长，避免出现明显低换长尾车。
-BALANCE_MIN_LENGTH_RATIO = 0.88
+BALANCE_MIN_LENGTH_RATIO = 0.90
 BALANCE_TARGET_LENGTH_RATIO = 0.96
-BALANCE_MAX_GAP_RATIO = 0.10
+BALANCE_MAX_GAP_RATIO = 0.08
 BALANCE_MAX_ITERATIONS = 320
 
 # 车辆层均衡只是软目标，任何时刻停止都不会破坏已经构造完成的硬约束方案。
@@ -60,9 +70,9 @@ COMPANY_SPREAD_WEIGHT = 0.35
 # 公司人员分布均衡参数：只作为软目标。
 # 若某公司被分到多辆车，尽量让各车上的该公司人数接近；
 # 但不为追求人数均衡破坏人-物同车、超重、超换长、yingjiName等硬约束。
-PERSON_BALANCE_MAX_RATIO = 0.25
-PERSON_BALANCE_MAX_ABS_GAP = 6
-PERSON_BALANCE_WEIGHT = 0.35
+PERSON_BALANCE_MAX_RATIO = 0.15
+PERSON_BALANCE_MAX_ABS_GAP = 3
+PERSON_BALANCE_WEIGHT = 0.85
 
 
 def get_app_dir() -> Path:
@@ -208,8 +218,15 @@ class SubContainer:
         self._component_key_all_tail = {}
         self._goods_zjdh_indices = set()
         self._pack_cache_size = 0
+        # 装备是否包含超限件。装箱阶段会增量维护，避免后续排序/候选评分反复扫描 contents。
+        self._has_chao_xian_equipment = False
+        # can_mix_goods_owner 在装箱候选搜索中被高频调用；按本次请求缓存箱内 yingjiName 集合。
+        self._effective_yingji_names_cache = None
 
-    def add_item(self, company_id, item_info, item_weight, item_load_value, item_volume=0.0):
+    def add_item(self, company_id, item_info, item_weight, item_load_value, item_volume=0.0, quantity=1):
+        quantity = safe_int(quantity, 1)
+        if quantity <= 0:
+            return False
         # 物资/装备特有的装箱逻辑：
         # - Small物资：校验体积、载重、同类件数上限；
         # - Large装备：不校验sbrl/sbzz，但必须校验装载占用比例，sum(1/zzsbidNumber)<=1。
@@ -229,20 +246,25 @@ class SubContainer:
 
             if self.goods_closed:
                 return False
-            if self.goods_item_counts[item_key] + 1 > item_limit:
+            if self.goods_item_counts[item_key] + quantity > item_limit:
                 return False
-            if self.current_load + item_fraction <= self.max_capacity + 1e-6:
-                self.current_load += item_fraction
+            if self.current_load + item_fraction * quantity <= self.max_capacity + 1e-6:
+                self.current_load += item_fraction * quantity
                 # Large不以体积/载重作为箱内拼装限制，但保留统计值，便于调试与输出扩展。
-                self.current_volume += float(item_volume)
-                self.current_payload += float(item_weight)
-                self.weight += float(item_weight)
-                self.contents.append(item_info)
+                self.current_volume += float(item_volume) * quantity
+                self.current_payload += float(item_weight) * quantity
+                self.weight += float(item_weight) * quantity
+                stored_item = item_info if quantity == 1 else dict(item_info)
+                stored_item['count'] = quantity
+                self.contents.append(stored_item)
                 self.owners.add(company_id)
+                self._effective_yingji_names_cache = None
+                if normalize_is_chaoxian(stored_item.get('is_chaoXian', '')) == '是':
+                    self._has_chao_xian_equipment = True
                 old_tail = self._component_key_all_tail.get(item_key, True)
-                self._component_key_all_tail[item_key] = old_tail and bool(item_info.get('_component_tail_candidate', False))
+                self._component_key_all_tail[item_key] = old_tail and bool(stored_item.get('_component_tail_candidate', False))
                 self._pack_cache_size = len(self.contents)
-                self.goods_item_counts[item_key] += 1
+                self.goods_item_counts[item_key] += quantity
                 self.goods_item_limits[item_key] = item_limit
                 if self.goods_item_counts[item_key] >= item_limit:
                     # 某一类装备达到自身zzsbidNumber后，视为单类满箱，本箱关闭。
@@ -258,22 +280,25 @@ class SubContainer:
 
             if self.goods_closed:
                 return False
-            if self.goods_item_counts[item_key] + 1 > item_limit:
+            if self.goods_item_counts[item_key] + quantity > item_limit:
                 return False
-            if self.current_volume + item_volume <= self.max_volume + 1e-6 and \
-                    self.current_payload + item_weight <= self.max_payload + 1e-6:
-                self.current_volume += item_volume
-                self.current_payload += item_weight
-                self.weight += float(item_weight)
-                self.contents.append(item_info)
+            if self.current_volume + item_volume * quantity <= self.max_volume + 1e-6 and \
+                    self.current_payload + item_weight * quantity <= self.max_payload + 1e-6:
+                self.current_volume += item_volume * quantity
+                self.current_payload += item_weight * quantity
+                self.weight += float(item_weight) * quantity
+                stored_item = item_info if quantity == 1 else dict(item_info)
+                stored_item['count'] = quantity
+                self.contents.append(stored_item)
                 self.owners.add(company_id)
+                self._effective_yingji_names_cache = None
                 old_tail = self._goods_key_all_tail.get(item_key, True)
-                self._goods_key_all_tail[item_key] = old_tail and bool(item_info.get('_goods_tail_candidate', False))
-                zjdh_idx = _cached_zjdh_index(item_info)
+                self._goods_key_all_tail[item_key] = old_tail and bool(stored_item.get('_goods_tail_candidate', False))
+                zjdh_idx = _cached_zjdh_index(stored_item)
                 if zjdh_idx is not None:
                     self._goods_zjdh_indices.add(zjdh_idx)
                 self._pack_cache_size = len(self.contents)
-                self.goods_item_counts[item_key] += 1
+                self.goods_item_counts[item_key] += quantity
                 self.goods_item_limits[item_key] = item_limit
                 if self.goods_item_counts[item_key] >= item_limit:
                     # 恢复原始闭箱逻辑：某一类物资达到该箱上限后，本箱视为已满，其他类型不能再进入。
@@ -458,27 +483,53 @@ def prepare_goods_items_for_tailmix(items):
     grouped = defaultdict(list)
     for raw in items:
         item = dict(raw)
+        quantity = safe_int(item.get('_batch_count', item.get('count', 1)), 1)
+        if quantity <= 0:
+            continue
+        item.pop('_batch_count', None)
         key = goods_item_key(item)
         item['_goods_item_key'] = key
-        grouped[key].append(item)
+        grouped[key].append((item, quantity))
 
     prepared = []
-    for key, arr in grouped.items():
-        if not arr:
+    for key, entries in grouped.items():
+        if not entries:
             continue
         # 同一类物资应使用相同 zzsbidNumber；若输入有差异，取最小正数作为保守上限。
-        limits = [safe_int(x.get('_goods_item_limit', x.get('zzsbidNumber', 1)), 1) for x in arr]
+        limits = [safe_int(x.get('_goods_item_limit', x.get('zzsbidNumber', 1)), 1)
+                  for x, _quantity in entries]
         limits = [x for x in limits if x > 0]
         item_limit = min(limits) if limits else 1
-        tail_count = len(arr) % item_limit
-        full_count = len(arr) - tail_count
-        for pos, item in enumerate(arr):
-            item['_goods_item_key'] = key
-            item['_goods_item_limit'] = item_limit
-            item['_goods_tail_candidate'] = bool(tail_count > 0 and pos >= full_count)
-            item['_goods_group_count'] = len(arr)
-            item['_goods_tail_count'] = tail_count
-            prepared.append(item)
+        group_count = sum(quantity for _item, quantity in entries)
+        tail_count = group_count % item_limit
+        non_tail_remaining = group_count - tail_count
+
+        # 保留原输入稳定顺序，只把连续同属性件压成计数批次。非尾数批次和尾数批次
+        # 仍带原来的标记，后续装箱会按容量一次加入若干件。
+        for item, quantity in entries:
+            non_tail_quantity = min(quantity, non_tail_remaining)
+            if non_tail_quantity > 0:
+                prepared_item = dict(item)
+                # ``_batch_count`` 承载本批数量；业务字段 count 保持“单件模板”语义，
+                # 避免批次恰好为 1 时 add_item 复用原字典而重复累计原始 count。
+                prepared_item['count'] = 1
+                prepared_item['_goods_item_limit'] = item_limit
+                prepared_item['_goods_tail_candidate'] = False
+                prepared_item['_goods_group_count'] = group_count
+                prepared_item['_goods_tail_count'] = tail_count
+                prepared_item['_batch_count'] = non_tail_quantity
+                prepared.append(prepared_item)
+                non_tail_remaining -= non_tail_quantity
+            tail_quantity = quantity - non_tail_quantity
+            if tail_quantity > 0:
+                prepared_item = dict(item)
+                prepared_item['count'] = 1
+                prepared_item['_goods_item_limit'] = item_limit
+                prepared_item['_goods_tail_candidate'] = True
+                prepared_item['_goods_group_count'] = group_count
+                prepared_item['_goods_tail_count'] = tail_count
+                prepared_item['_batch_count'] = tail_quantity
+                prepared.append(prepared_item)
 
     # 先处理非尾数部分，使每类物资优先装满本类箱；再处理尾数部分用于拼箱。
     prepared.sort(
@@ -539,26 +590,47 @@ def prepare_component_items_for_tailmix(items):
     grouped = defaultdict(list)
     for raw in items:
         item = dict(raw)
+        quantity = safe_int(item.get('_batch_count', item.get('count', 1)), 1)
+        if quantity <= 0:
+            continue
+        item.pop('_batch_count', None)
         key = component_item_key(item)
         item['_component_item_key'] = key
-        grouped[key].append(item)
+        grouped[key].append((item, quantity))
 
     prepared = []
-    for key, arr in grouped.items():
-        if not arr:
+    for key, entries in grouped.items():
+        if not entries:
             continue
-        limits = [safe_int(x.get('_component_item_limit', x.get('zzsbidNumber', 1)), 1) for x in arr]
+        limits = [safe_int(x.get('_component_item_limit', x.get('zzsbidNumber', 1)), 1)
+                  for x, _quantity in entries]
         limits = [x for x in limits if x > 0]
         item_limit = min(limits) if limits else 1
-        tail_count = len(arr) % item_limit
-        full_count = len(arr) - tail_count
-        for pos, item in enumerate(arr):
-            item['_component_item_key'] = key
-            item['_component_item_limit'] = item_limit
-            item['_component_tail_candidate'] = bool(tail_count > 0 and pos >= full_count)
-            item['_component_group_count'] = len(arr)
-            item['_component_tail_count'] = tail_count
-            prepared.append(item)
+        group_count = sum(quantity for _item, quantity in entries)
+        tail_count = group_count % item_limit
+        non_tail_remaining = group_count - tail_count
+        for item, quantity in entries:
+            non_tail_quantity = min(quantity, non_tail_remaining)
+            if non_tail_quantity > 0:
+                prepared_item = dict(item)
+                prepared_item['count'] = 1
+                prepared_item['_component_item_limit'] = item_limit
+                prepared_item['_component_tail_candidate'] = False
+                prepared_item['_component_group_count'] = group_count
+                prepared_item['_component_tail_count'] = tail_count
+                prepared_item['_batch_count'] = non_tail_quantity
+                prepared.append(prepared_item)
+                non_tail_remaining -= non_tail_quantity
+            tail_quantity = quantity - non_tail_quantity
+            if tail_quantity > 0:
+                prepared_item = dict(item)
+                prepared_item['count'] = 1
+                prepared_item['_component_item_limit'] = item_limit
+                prepared_item['_component_tail_candidate'] = True
+                prepared_item['_component_group_count'] = group_count
+                prepared_item['_component_tail_count'] = tail_count
+                prepared_item['_batch_count'] = tail_quantity
+                prepared.append(prepared_item)
 
     # 非尾数先处理，尾数后处理；同一 zzsbid 内再按体积/重量大的优先。
     prepared.sort(
@@ -877,9 +949,21 @@ def effective_yingji_names_for_owners(owners, company_yingji_name):
 
 def can_mix_goods_owner(box, new_owner_id, company_yingji_name):
     """物资箱允许跨公司混装，但不能让该箱涉及的 yingjiName 种类超过 2。"""
-    owners = set(getattr(box, 'owners', set()))
-    owners.add(new_owner_id)
-    return len(effective_yingji_names_for_owners(owners, company_yingji_name)) <= 2
+    cache = getattr(box, '_effective_yingji_names_cache', None)
+    if cache is None or cache[0] is not company_yingji_name:
+        current_names = frozenset(effective_yingji_names_for_owners(
+            getattr(box, 'owners', set()), company_yingji_name
+        ))
+        cache = (company_yingji_name, current_names)
+        try:
+            box._effective_yingji_names_cache = cache
+        except Exception:
+            # 兼容外部传入的只读箱对象；不影响原始判定。
+            pass
+    new_name = company_yingji_name.get(new_owner_id, '')
+    if is_effective_yingji_name(new_name) and new_name not in cache[1]:
+        return len(cache[1]) < 2
+    return len(cache[1]) <= 2
 
 
 def normalize_is_chaoxian(value):
@@ -900,6 +984,12 @@ def normalize_is_chaoxian(value):
 def box_has_chaoxian_equipment(box):
     if get_public_box_type(getattr(box, 'box_type', '')) != 'Large':
         return False
+    cached_owners = getattr(box, '_cached_chao_owners', None)
+    if cached_owners is not None:
+        return bool(cached_owners)
+    cached_flag = getattr(box, '_has_chao_xian_equipment', None)
+    if cached_flag is not None:
+        return bool(cached_flag)
     for item in getattr(box, 'contents', []):
         if item.get('type') == 'component' and normalize_is_chaoxian(item.get('is_chaoXian', '')) == '是':
             return True
@@ -929,6 +1019,8 @@ class VehicleState:
         self.units = []
         self.companies = set()
         self.yingji_companies = defaultdict(set)
+        # yingji_companies 的非空键集合；can_place 被候选搜索高频调用，直接复用该集合。
+        self._yingji_names = set()
         self.chaoXian_companies = set()
         # 等价性能缓存：只记录同一公司/超限公司当前出现在多少个装车单元中。
         # 不改变任何装车规则、评分或输出，仅避免 remove 时反复扫描整辆车的全部单元。
@@ -944,6 +1036,7 @@ class VehicleState:
         other.units = list(self.units)
         other.companies = set(self.companies)
         other.yingji_companies = defaultdict(set, {g: set(cids) for g, cids in self.yingji_companies.items()})
+        other._yingji_names = set(self._yingji_names)
         other.chaoXian_companies = set(self.chaoXian_companies)
         other._company_unit_counts = defaultdict(int, self._company_unit_counts)
         other._chaoxian_unit_counts = defaultdict(int, self._chaoxian_unit_counts)
@@ -955,15 +1048,14 @@ class VehicleState:
             return False
         if self.length + unit['length'] > max_length + 1e-6:
             return False
-        current_yingji_names = {
-            y for y, cids in self.yingji_companies.items()
-            if is_effective_yingji_name(y) and len(cids) > 0
-        }
-        unit_yingji_names = {
-            company_yingji_name.get(cid, '') for cid in unit['owners']
-            if is_effective_yingji_name(company_yingji_name.get(cid, ''))
-        }
-        if len(current_yingji_names | unit_yingji_names) > 2:
+        unit_yingji_names = unit.get('_yingji_names')
+        if unit_yingji_names is None:
+            unit_yingji_names = {
+                company_yingji_name.get(cid, '') for cid in unit['owners']
+                if is_effective_yingji_name(company_yingji_name.get(cid, ''))
+            }
+        # 与原 union 判断等价，但不为每个候选重复遍历 yingji_companies 并创建当前集合。
+        if len(self._yingji_names) + len(unit_yingji_names - self._yingji_names) > 2:
             return False
         return True
 
@@ -978,6 +1070,7 @@ class VehicleState:
                 yingji_name = company_yingji_name.get(cid, '')
                 if is_effective_yingji_name(yingji_name):
                     self.yingji_companies[yingji_name].add(cid)
+                    self._yingji_names.add(yingji_name)
         if unit.get('has_chaoXian_equipment'):
             for cid in unit.get('chaoXian_owners', set()):
                 self._chaoxian_unit_counts[cid] += 1
@@ -1004,6 +1097,7 @@ class VehicleState:
                     cids.discard(cid)
                     if not cids:
                         self.yingji_companies.pop(yingji_name, None)
+                        self._yingji_names.discard(yingji_name)
         if unit.get('has_chaoXian_equipment'):
             for cid in unit.get('chaoXian_owners', set()):
                 remaining = self._chaoxian_unit_counts.get(cid, 0) - 1
@@ -1146,14 +1240,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
             # === 处理装备组件（Large：同zzsbid、componentname+zzsbid识别同类、尾数拼箱、yingjiName≤2；不检查sbrl/sbzz） ===
             comps_list = comp.get('componentList', []) or []
-            expanded_components = []
-            for c_item in comps_list:
-                count = safe_int(c_item.get('count', 1), 1)
-                for _ in range(count):
-                    expanded_components.append(dict(c_item))
-
-            # Large装备也执行“先同类装满、尾数再拼箱”。
-            prepared_components = prepare_component_items_for_tailmix(expanded_components)
+            # 直接按 count 批量准备，避免上万件装备展开成上万个 Python 字典。
+            prepared_components = prepare_component_items_for_tailmix(comps_list)
 
             for item in prepared_components:
                 name = item.get('componentname', '')
@@ -1167,7 +1255,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 occupancy = 1.0 / item_limit
                 zzsbid = spec.get('id', '')
                 zhuang_zai = spec.get('sbmc', '')
-                c_key = component_item_key(item)
+                c_key = item.get('_component_item_key') or component_item_key(item)
 
                 item_info = {
                     "type": "component",
@@ -1197,70 +1285,65 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
                 # 初装阶段仍按“同公司 + 同zzsbid”开放Large箱；跨公司Large混装放到同一SC确定后的二次重装阶段执行。
                 key = (cid, zzsbid)
-                placed = False
-                best_box = None
-                best_score = None
-                for box in open_large_boxes[key]:
-                    if box.capacity_type != 'component_pack':
-                        continue
-                    if getattr(box, 'goods_closed', False):
-                        continue
-                    if not can_pack_component_item(box, item_info, company_yingji_name, zjdh_forbid_matrix):
-                        continue
-                    if box.goods_item_counts[c_key] + 1 > item_limit:
-                        continue
-                    # Large不按sbrl/sbzz判断；只按同zzsbid、尾数拼箱、zzsbidNumber、占用比例和yingjiName规则。
-                    new_load_ratio = (box.current_load + occupancy) / box.max_capacity if box.max_capacity else 1.0
-                    count_ratio = (box.goods_item_counts[c_key] + 1) / item_limit if item_limit else 1.0
-                    owner_bonus = 0.15 if cid in box.owners else 0.0
-                    chao_bonus = 0.10 if normalize_is_chaoxian(item_info.get('is_chaoXian', '')) == '是' else 0.0
-                    tail_bonus = 0.08 if item_info.get('_component_tail_candidate') else 0.0
-                    score = 0.75 * new_load_ratio + 0.15 * count_ratio + owner_bonus + chao_bonus + tail_bonus
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best_box = box
+                remaining_quantity = safe_int(item.get('_batch_count', 1), 1)
+                while remaining_quantity > 0:
+                    best_box = None
+                    best_score = None
+                    for box in open_large_boxes[key]:
+                        if box.capacity_type != 'component_pack':
+                            continue
+                        if getattr(box, 'goods_closed', False):
+                            continue
+                        if not can_pack_component_item(box, item_info, company_yingji_name, zjdh_forbid_matrix):
+                            continue
+                        if box.goods_item_counts[c_key] + 1 > item_limit:
+                            continue
+                        # Large不按sbrl/sbzz判断；只按同zzsbid、尾数拼箱、zzsbidNumber、占用比例和yingjiName规则。
+                        new_load_ratio = (box.current_load + occupancy) / box.max_capacity if box.max_capacity else 1.0
+                        count_ratio = (box.goods_item_counts[c_key] + 1) / item_limit if item_limit else 1.0
+                        owner_bonus = 0.15 if cid in box.owners else 0.0
+                        chao_bonus = 0.10 if normalize_is_chaoxian(item_info.get('is_chaoXian', '')) == '是' else 0.0
+                        tail_bonus = 0.08 if item_info.get('_component_tail_candidate') else 0.0
+                        score = 0.75 * new_load_ratio + 0.15 * count_ratio + owner_bonus + chao_bonus + tail_bonus
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_box = box
 
-                if best_box is not None:
-                    if not best_box.add_item(cid, item_info, w, occupancy, item_volume=vol):
-                        raise AlgorithmError(f'装备 {name or comp_id} 匹配到旧Large箱但装入失败，请检查体积/载重/zzsbidNumber')
-                    # 已闭箱的Large后续必定会被原逻辑跳过，立即移出候选列表只减少无效扫描。
-                    if getattr(best_box, 'goods_closed', False):
-                        open_large_boxes[key].remove(best_box)
-                    placed = True
+                    if best_box is None:
+                        best_box = SubContainer(
+                            'Large',
+                            spec['sbhc'],
+                            spec['sbzl'],
+                            1.0,
+                            'component_pack',
+                            zzsbid=zzsbid,
+                            zhuang_zai=zhuang_zai,
+                        )
+                        # Large不使用sbrl/sbzz作为拼箱限制；这里只保留SC总重/总换长校验。
+                        best_box.max_payload = 999999999.0
+                        best_box.max_volume = 999999999.0
+                        all_sub_containers.append(best_box)
+                        open_large_boxes[key].append(best_box)
 
-                if not placed:
-                    new_box = SubContainer(
-                        'Large',
-                        spec['sbhc'],
-                        spec['sbzl'],
-                        1.0,
-                        'component_pack',
-                        zzsbid=zzsbid,
-                        zhuang_zai=zhuang_zai,
-                    )
-                    # Large不使用sbrl/sbzz作为拼箱限制；这里设为极大值，仅保留SC总重/总换长校验。
-                    new_box.max_payload = 999999999.0
-                    new_box.max_volume = 999999999.0
-                    if not new_box.add_item(cid, item_info, w, occupancy, item_volume=vol):
+                    count_space = item_limit - best_box.goods_item_counts[c_key]
+                    load_space = int(math.floor(
+                        (best_box.max_capacity - best_box.current_load + 1e-6) / occupancy
+                    )) if occupancy > 0 else remaining_quantity
+                    to_add = min(remaining_quantity, count_space, load_space)
+                    if to_add <= 0 or not best_box.add_item(
+                            cid, item_info, w, occupancy, item_volume=vol, quantity=to_add):
                         raise AlgorithmError(
-                            f'装备 {name or comp_id} Large装入失败：zzsbid={zzsbid}, '
+                            f'装备 {name or comp_id} Large批量装入失败：zzsbid={zzsbid}, '
                             f'请检查zzsbidNumber或尾数拼箱规则'
                         )
-                    all_sub_containers.append(new_box)
-                    # 新箱若单件即满，原逻辑后续只会跳过；不放入开放候选列表。
-                    if not getattr(new_box, 'goods_closed', False):
-                        open_large_boxes[key].append(new_box)
+                    remaining_quantity -= to_add
+                    if getattr(best_box, 'goods_closed', False):
+                        open_large_boxes[key].remove(best_box)
 
             # === 处理物资（按文档新规则：不再按category分装，按zzsbidNumber、体积、载重混装） ===
             goods_list = comp.get('goodsList', []) or []
-            expanded_goods = []
-            for g in goods_list:
-                count = safe_int(g.get('count', 1), 1)
-                for _ in range(count):
-                    expanded_goods.append(g.copy())
-
-            # 恢复“先同类装满、尾数再拼箱”：非尾数部分先处理，尾数部分后处理并允许按规则拼箱。
-            flat_goods = prepare_goods_items_for_tailmix(expanded_goods)
+            # 直接按 count 批量准备；尾数边界仍由 prepare_goods_items_for_tailmix 精确拆分。
+            flat_goods = prepare_goods_items_for_tailmix(goods_list)
 
             for item in flat_goods:
                 name = item.get('name', '')
@@ -1274,7 +1357,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 cat = item.get('category', '未分类')
                 zzsbid = spec.get('id', '')
                 zhuang_zai = spec.get('sbmc', '')
-                g_key = goods_item_key(item)
+                g_key = item.get('_goods_item_key') or goods_item_key(item)
 
                 item_info = {
                     "type": "goods",
@@ -1303,68 +1386,69 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 # 因此预处理阶段只按“同公司 + 同装载车辆zzsbid”开放物资箱；
                 # 等SC装车方案确定后，再在同一SC内部对Small物资箱进行跨公司重装/混装。
                 key = (cid, zzsbid)
-                placed = False
-                best_box = None
-                best_score = None
+                remaining_quantity = safe_int(item.get('_batch_count', 1), 1)
+                while remaining_quantity > 0:
+                    best_box = None
+                    best_score = None
 
-                for box in open_small_boxes[key]:
-                    if box.capacity_type != 'goods_pack':
-                        continue
-                    if getattr(box, 'goods_closed', False):
-                        continue
-                    if not can_pack_goods_item(box, item_info, company_yingji_name, zjdh_forbid_matrix):
-                        continue
-                    if box.goods_item_counts[g_key] + 1 > item_limit:
-                        continue
-                    if box.current_volume + tj > box.max_volume + 1e-6:
-                        continue
-                    if box.current_payload + w > box.max_payload + 1e-6:
-                        continue
+                    for box in open_small_boxes[key]:
+                        if box.capacity_type != 'goods_pack':
+                            continue
+                        if getattr(box, 'goods_closed', False):
+                            continue
+                        if not can_pack_goods_item(box, item_info, company_yingji_name, zjdh_forbid_matrix):
+                            continue
+                        if box.goods_item_counts[g_key] + 1 > item_limit:
+                            continue
+                        if box.current_volume + tj > box.max_volume + 1e-6:
+                            continue
+                        if box.current_payload + w > box.max_payload + 1e-6:
+                            continue
 
-                    new_volume = box.current_volume + tj
-                    new_payload = box.current_payload + w
-                    vol_ratio = new_volume / box.max_volume if box.max_volume else 0.0
-                    wt_ratio = new_payload / box.max_payload if box.max_payload else 0.0
-                    count_ratio = (box.goods_item_counts[g_key] + 1) / item_limit if item_limit else 1.0
-                    owner_bonus = 0.15 if cid in box.owners else 0.0
-                    # 优先选装后更满的箱；同公司略优先，但不禁止跨公司混装。
-                    score = 0.55 * max(vol_ratio, wt_ratio) + 0.25 * min(vol_ratio, wt_ratio) + 0.20 * count_ratio + owner_bonus
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best_box = box
+                        new_volume = box.current_volume + tj
+                        new_payload = box.current_payload + w
+                        vol_ratio = new_volume / box.max_volume if box.max_volume else 0.0
+                        wt_ratio = new_payload / box.max_payload if box.max_payload else 0.0
+                        count_ratio = (box.goods_item_counts[g_key] + 1) / item_limit if item_limit else 1.0
+                        owner_bonus = 0.15 if cid in box.owners else 0.0
+                        score = 0.55 * max(vol_ratio, wt_ratio) + 0.25 * min(vol_ratio, wt_ratio) + 0.20 * count_ratio + owner_bonus
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_box = box
 
-                if best_box is not None:
-                    if not best_box.add_item(cid, item_info, w, 0.0, item_volume=tj):
-                        raise AlgorithmError(f'物资 {name or gid} 匹配到旧箱但装入失败，请检查体积/载重/zzsbidNumber')
-                    # 已闭箱的Small后续必定会被原逻辑跳过，立即移出候选列表只减少无效扫描。
+                    if best_box is None:
+                        best_box = SubContainer(
+                            'Small',
+                            spec['sbhc'],
+                            spec['sbzl'],
+                            1.0,
+                            'goods_pack',
+                            category=None,
+                            zzsbid=zzsbid,
+                            zhuang_zai=zhuang_zai,
+                        )
+                        best_box.max_payload = spec.get('sbzz') if spec.get('sbzz', 0) > 0 else 999999999.0
+                        best_box.max_volume = spec.get('sbrl') if spec.get('sbrl', 0) > 0 else 999999999.0
+                        all_sub_containers.append(best_box)
+                        open_small_boxes[key].append(best_box)
+
+                    count_space = item_limit - best_box.goods_item_counts[g_key]
+                    volume_space = int(math.floor(
+                        (best_box.max_volume - best_box.current_volume + 1e-6) / tj
+                    )) if tj > 0 else remaining_quantity
+                    payload_space = int(math.floor(
+                        (best_box.max_payload - best_box.current_payload + 1e-6) / w
+                    )) if w > 0 else remaining_quantity
+                    to_add = min(remaining_quantity, count_space, volume_space, payload_space)
+                    if to_add <= 0 or not best_box.add_item(
+                            cid, item_info, w, 0.0, item_volume=tj, quantity=to_add):
+                        raise AlgorithmError(
+                            f'物资 {name or gid} 批量装入失败：weight={w:.1f}, tj={tj:.2f}, '
+                            f'zzsbid={zzsbid}, sbzz={best_box.max_payload:.1f}, sbrl={best_box.max_volume:.2f}'
+                        )
+                    remaining_quantity -= to_add
                     if getattr(best_box, 'goods_closed', False):
                         open_small_boxes[key].remove(best_box)
-                    placed = True
-
-                if not placed:
-                    new_box = SubContainer(
-                        'Small',
-                        spec['sbhc'],
-                        spec['sbzl'],
-                        1.0,
-                        'goods_pack',
-                        category=None,
-                        zzsbid=zzsbid,
-                        zhuang_zai=zhuang_zai,
-                    )
-                    # 文档使用 sbzz 表示最大载重、sbrl 表示最大体积；输入暂未提供时沿用大容量兜底，保证兼容旧样例。
-                    new_box.max_payload = spec.get('sbzz') if spec.get('sbzz', 0) > 0 else 999999999.0
-                    new_box.max_volume = spec.get('sbrl') if spec.get('sbrl', 0) > 0 else 999999999.0
-
-                    if not new_box.add_item(cid, item_info, w, 0.0, item_volume=tj):
-                        raise AlgorithmError(
-                            f'物资 {name or gid} 自身超过装载车辆限制：weight={w:.1f}, tj={tj:.2f}, '
-                            f'zzsbid={zzsbid}, sbzz={new_box.max_payload:.1f}, sbrl={new_box.max_volume:.2f}'
-                        )
-                    all_sub_containers.append(new_box)
-                    # 新箱若单件即满，原逻辑后续只会跳过；不放入开放候选列表。
-                    if not getattr(new_box, 'goods_closed', False):
-                        open_small_boxes[key].append(new_box)
 
         logger.info("预处理完成，生成小车/小箱总数=%s", len(all_sub_containers))
         original_boxes = all_sub_containers.copy()
@@ -1856,7 +1940,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 total_w += b.weight
                 total_l += b.length_unit
                 chao_owners.update(getattr(b, '_cached_chao_owners', set()))
-                if getattr(b, '_cached_public_type', get_public_box_type(b.box_type)) == 'Person':
+                public_type = getattr(b, '_cached_public_type', None)
+                if public_type is None:
+                    public_type = get_public_box_type(b.box_type)
+                if public_type == 'Person':
                     has_person_box = True
                     person_box_count += 1
                     person_w += b.weight
@@ -1870,9 +1957,14 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     non_person_w += b.weight
                     non_person_l += b.length_unit
                     non_person_owners.update(b.owners)
+            unit_yingji_names = {
+                company_yingji_name.get(cid, '') for cid in owners
+                if is_effective_yingji_name(company_yingji_name.get(cid, ''))
+            }
             return UnitDict({
                 'box_indices': list(box_indices),
                 'owners': owners,
+                '_yingji_names': unit_yingji_names,
                 'weight': total_w,
                 'length': total_l,
                 'dominant': dominant_ratio(total_w, total_l, max_weight_per_sc, max_length_per_sc),
@@ -1932,7 +2024,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 chunk['chaoXian_owners'].update(getattr(b, '_cached_chao_owners', set()))
                 chunk['has_chaoXian_equipment'] = len(chunk['chaoXian_owners']) > 0
                 # 同步维护 make_unit 中的内部性能缓存；业务字段、评分和候选顺序均不变。
-                if getattr(b, '_cached_public_type', get_public_box_type(b.box_type)) == 'Person':
+                public_type = getattr(b, '_cached_public_type', None)
+                if public_type is None:
+                    public_type = get_public_box_type(b.box_type)
+                if public_type == 'Person':
                     chunk['_has_person_box'] = True
                     chunk['_person_owners'].update(b.owners)
                     chunk['_person_w'] += b.weight
@@ -2130,7 +2225,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     )
 
                 chao_indices = [i for i in non_person_indices if box_has_chaoxian_equipment(all_sub_containers[i])]
-                normal_non_person_indices = [i for i in non_person_indices if i not in set(chao_indices)]
+                chao_index_set = set(chao_indices)
+                normal_non_person_indices = [i for i in non_person_indices if i not in chao_index_set]
                 base_ordered_non_person = sorted(
                     chao_indices + normal_non_person_indices,
                     key=lambda i: (
@@ -2152,6 +2248,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 # 下列总量与target_count/排序策略无关，只计算一次。
                 total_person_l = sum(all_sub_containers[i].length_unit for i in person_indices)
                 total_person_w = sum(all_sub_containers[i].weight for i in person_indices)
+                total_person_count = sum(
+                    getattr(all_sub_containers[i], '_cached_person_counts', {}).get(cid, 0)
+                    for i in person_indices
+                )
                 total_non_person_l = sum(all_sub_containers[i].length_unit for i in non_person_indices)
                 total_non_person_w = sum(all_sub_containers[i].weight for i in non_person_indices)
 
@@ -2445,6 +2545,97 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         idx = remaining_non_person.pop(best_pos)
                         add_box_to_chunk(chunks[k], idx)
 
+                    def try_people_balanced_before_remaining_goods(seed_chunks, person_list, non_person_list):
+                        """先均衡人员、再填剩余物资的快速候选。
+
+                        原路径仍保留在下方作为回退；因此该候选若因箱体离散容量装不下某件
+                        物资，只会放弃本候选，不会把可行数据误报成无解。
+                        """
+                        work = [make_unit(c.get('box_indices', []), forced_owners={cid}) for c in seed_chunks]
+                        people_left = list(person_list)
+                        goods_left = list(non_person_list)
+
+                        reserved = reserve_distinct_persons(work, people_left)
+                        if reserved is None:
+                            return None
+                        for k, idx0 in reserved.items():
+                            if idx0 not in people_left or not can_add_to_chunk(work[k], idx0):
+                                return None
+                            people_left.remove(idx0)
+                            add_box_to_chunk(work[k], idx0)
+
+                        target_people0 = total_person_count / target_count if target_count else total_person_count
+                        people_left.sort(
+                            key=lambda bi: getattr(all_sub_containers[bi], '_cached_person_counts', {}).get(cid, 0),
+                            reverse=True,
+                        )
+                        for idx0 in people_left:
+                            box0 = all_sub_containers[idx0]
+                            adding_people0 = getattr(box0, '_cached_person_counts', {}).get(cid, 0)
+                            best_k0 = None
+                            best_score0 = None
+                            for k, chunk0 in enumerate(work):
+                                if not can_add_to_chunk(chunk0, idx0):
+                                    continue
+                                before_people0 = chunk0.get('_person_counts', {}).get(cid, 0)
+                                before_gap0 = (before_people0 - target_people0) / max(target_people0, 1.0)
+                                after_gap0 = (before_people0 + adding_people0 - target_people0) / max(target_people0, 1.0)
+                                # 使用平方差的增量而不是只看“当前最少”，兼顾不同载员量人员箱。
+                                score0 = after_gap0 ** 2 - before_gap0 ** 2
+                                score0 += 0.03 * (
+                                    (chunk0['length'] + box0.length_unit) / max(max_length_per_sc, 1e-9)
+                                )
+                                if best_score0 is None or score0 < best_score0:
+                                    best_score0 = score0
+                                    best_k0 = k
+                            if best_k0 is None:
+                                return None
+                            add_box_to_chunk(work[best_k0], idx0)
+
+                        target_total_l0 = (total_person_l + total_non_person_l) / target_count
+                        target_total_w0 = (total_person_w + total_non_person_w) / target_count
+                        for idx0 in goods_left:
+                            box0 = all_sub_containers[idx0]
+                            best_k0 = None
+                            best_score0 = None
+                            for k, chunk0 in enumerate(work):
+                                if not can_add_to_chunk(chunk0, idx0):
+                                    continue
+                                new_l0 = chunk0['length'] + box0.length_unit
+                                new_w0 = chunk0['weight'] + box0.weight
+                                length_delta0 = (
+                                    (new_l0 - target_total_l0) ** 2
+                                    - (chunk0['length'] - target_total_l0) ** 2
+                                )
+                                weight_delta0 = (
+                                    (new_w0 - target_total_w0) ** 2
+                                    - (chunk0['weight'] - target_total_w0) ** 2
+                                ) / max(max_weight_per_sc, 1.0)
+                                score0 = length_delta0 + 0.08 * weight_delta0
+                                if box_has_chaoxian_equipment(box0) and chunk0.get('has_chaoXian_equipment'):
+                                    score0 -= 0.15
+                                if best_score0 is None or score0 < best_score0:
+                                    best_score0 = score0
+                                    best_k0 = k
+                            if best_k0 is None:
+                                return None
+                            add_box_to_chunk(work[best_k0], idx0)
+
+                        try:
+                            assert_no_single_type_chunks(work)
+                        except AlgorithmError:
+                            return None
+                        return work
+
+                    average_total_length0 = (total_person_l + total_non_person_l) / target_count
+                    if (FAST_FEASIBLE_MODE and
+                            average_total_length0 >= max_length_per_sc * BALANCE_MIN_LENGTH_RATIO - 1e-6):
+                        people_first_chunks = try_people_balanced_before_remaining_goods(
+                            chunks, remaining_person, remaining_non_person
+                        )
+                        if people_first_chunks is not None:
+                            return people_first_chunks, ''
+
                     # 第二步：先分摊剩余物资/装备箱。
                     # 与上一版不同，这一步放在配人员之前，避免人员先占满某个小物资块的容量，导致后续物资进不去。
                     for idx in remaining_non_person:
@@ -2497,7 +2688,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         remaining_person.remove(idx)
                         add_box_to_chunk(chunks[k], idx)
 
-                    # 第四步：剩余人员继续按“非人员负载比例”分摊到已有混合块，不能新建纯人员块。
+                    # 第四步：剩余人员在兼顾非人员占用的同时，强优先均衡实际人数；
+                    # 不能新建纯人员块，也不会拆改已经确定的人员箱。
+                    target_people = total_person_count / target_count if target_count else total_person_count
                     for idx in remaining_person:
                         best_k = None
                         best_score = None
@@ -2518,9 +2711,24 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                             l_gap_before = abs(load['person_l'] - target_l) / max(target_l, 1e-6)
                             w_gap_after = abs(new_person_w - target_w) / max(target_w, 1e-6) if target_w > 1e-9 else 0.0
                             over_l = max(0.0, new_person_l - target_l) / max(target_l, 1e-6)
-                            # 只把人员继续放到“按物资比例还缺人”的块里；如果已经超目标，强惩罚。
+                            current_people = chunk.get('_person_counts', {}).get(cid, 0)
+                            adding_people = getattr(b, '_cached_person_counts', {}).get(cid, 0)
+                            people_gap_before = abs(current_people - target_people) / max(target_people, 1.0)
+                            people_gap_after = abs(current_people + adding_people - target_people) / max(target_people, 1.0)
+                            people_over = max(0.0, current_people + adding_people - target_people) / max(target_people, 1.0)
                             improvement = l_gap_before - l_gap_after
-                            score = 1.20 * improvement - 1.35 * l_gap_after - 0.45 * w_gap_after - 1.10 * over_l - 0.16 * max(fill_l, fill_w) - 0.08 * abs(fill_l - fill_w)
+                            people_improvement = people_gap_before - people_gap_after
+                            score = (
+                                1.05 * improvement
+                                - 1.10 * l_gap_after
+                                - 0.35 * w_gap_after
+                                - 0.90 * over_l
+                                + 2.40 * people_improvement
+                                - 2.10 * people_gap_after
+                                - 1.40 * people_over
+                                - 0.16 * max(fill_l, fill_w)
+                                - 0.08 * abs(fill_l - fill_w)
+                            )
                             if best_score is None or score > best_score:
                                 best_score = score
                                 best_k = k
@@ -2565,7 +2773,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     return [(name, np_order, p_order) for _sig, name, np_order, p_order in variants]
 
                 def chunks_balance_score(chunks):
-                    """公司内部候选块评分：优先可行，其次换长更均衡；必要时允许多拆一块。"""
+                    """公司内部候选块评分：换长和人数都按强软约束处理。"""
                     if not chunks:
                         return float('inf')
                     lengths = [c['length'] for c in chunks]
@@ -2577,7 +2785,310 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     range_penalty = (max(lengths) - min(lengths)) ** 2 if len(lengths) > 1 else 0.0
                     weight_range = (max(weights) - min(weights)) ** 2 / max(max_weight_per_sc, 1.0) if len(weights) > 1 else 0.0
                     extra_count_penalty = 0.35 * max(0, len(chunks) - lower_count) * (max_length_per_sc ** 2)
-                    return 2.20 * under_penalty + 0.85 * target_gap + 0.55 * range_penalty + 0.05 * weight_range + extra_count_penalty
+                    people = [c.get('_person_counts', {}).get(cid, 0) for c in chunks]
+                    people_penalty = 0.0
+                    if len(people) > 1 and sum(people) > 0:
+                        avg_people = sum(people) / len(people)
+                        rel_var = sum(((p - avg_people) / avg_people) ** 2 for p in people) / len(people)
+                        allowed_gap = max(PERSON_BALANCE_MAX_ABS_GAP, avg_people * PERSON_BALANCE_MAX_RATIO)
+                        range_over = max(0.0, max(people) - min(people) - allowed_gap) / max(avg_people, 1.0)
+                        people_penalty = rel_var + 1.50 * (range_over ** 2)
+                    return (
+                        4.50 * under_penalty
+                        + 0.85 * target_gap
+                        + 1.00 * range_penalty
+                        + 0.05 * weight_range
+                        + extra_count_penalty
+                        + PERSON_BALANCE_WEIGHT * (max_length_per_sc ** 2) * people_penalty
+                    )
+
+                def rebalance_company_chunks_fast(chunks):
+                    """在固定车辆数内搬移整箱，集中消除短尾车并均衡本公司人数。
+
+                    这里只移动已经通过装箱规则的小箱，不拆箱、不改箱内混装关系；每个候选
+                    都重新检查 SC 重量/换长和“有物必有人”，因此中途达到时间预算也能直接
+                    返回最后一组完整可行解。
+                    """
+                    if len(chunks) < 2:
+                        return chunks
+                    # 若固定车辆数下连“平均换长”都达不到下限，把公司内部摊成一批
+                    # 中等长度单元反而会阻止不同公司的短尾单元互补合车。此类情况留给
+                    # 全局装车阶段组合；只有理论上能整体接近最大换长时才做公司内摊平。
+                    average_length = sum(c['length'] for c in chunks) / len(chunks)
+                    allow_length_moves = (
+                        average_length >= max_length_per_sc * BALANCE_MIN_LENGTH_RATIO - 1e-6
+                    )
+                    nonlocal company_balance_spent
+                    remaining_budget = FAST_COMPANY_BALANCE_SECONDS - company_balance_spent
+                    if FAST_FEASIBLE_MODE and remaining_budget <= 0.0:
+                        return chunks
+                    balance_started = time.monotonic()
+                    # 给每个大公司一个小时间片，防止排在前面的公司独占全部均衡预算。
+                    local_deadline = balance_started + min(0.20, max(0.0, remaining_budget))
+                    current = list(chunks)
+                    total_people = sum(c.get('_person_counts', {}).get(cid, 0) for c in current)
+                    average_people = total_people / len(current) if current else 0.0
+                    total_boxes = sum(len(c.get('box_indices', [])) for c in current)
+                    max_moves = min(128, max(16, total_boxes))
+
+                    def local_cost(length, people_count):
+                        under = max(0.0, max_length_per_sc * BALANCE_MIN_LENGTH_RATIO - length)
+                        length_cost = (
+                            7.50 * (under ** 2)
+                            + 1.20 * ((length - average_length) ** 2)
+                            + 0.15 * ((length - max_length_per_sc * BALANCE_TARGET_LENGTH_RATIO) ** 2)
+                        )
+                        people_cost = 0.0
+                        if average_people > 1e-9:
+                            rel_gap = (people_count - average_people) / average_people
+                            people_cost = PERSON_BALANCE_WEIGHT * (max_length_per_sc ** 2) * (rel_gap ** 2)
+                        return length_cost + people_cost
+
+                    for _ in range(max_moves if allow_length_moves else 0):
+                        if FAST_FEASIBLE_MODE and time.monotonic() >= local_deadline:
+                            break
+
+                        people = [c.get('_person_counts', {}).get(cid, 0) for c in current]
+                        shortest = sorted(range(len(current)), key=lambda k: current[k]['length'])[:2]
+                        least_people = sorted(range(len(current)), key=lambda k: people[k])[:2]
+                        receivers = list(dict.fromkeys(shortest + least_people))
+                        longest = sorted(range(len(current)), key=lambda k: current[k]['length'], reverse=True)[:8]
+                        most_people = sorted(range(len(current)), key=lambda k: people[k], reverse=True)[:4]
+                        donors = list(dict.fromkeys(longest + most_people))
+
+                        best = None
+                        best_score = 0.0
+                        for receiver_idx in receivers:
+                            receiver = current[receiver_idx]
+                            for donor_idx in donors:
+                                if donor_idx == receiver_idx:
+                                    continue
+                                donor = current[donor_idx]
+                                donor_indices = donor.get('box_indices', [])
+                                if len(donor_indices) <= 1:
+                                    continue
+                                ideal_transfer = max(0.0, (donor['length'] - receiver['length']) / 2.0)
+                                movable = sorted(
+                                    donor_indices,
+                                    key=lambda bi: (
+                                        abs(all_sub_containers[bi].length_unit - ideal_transfer),
+                                        -getattr(all_sub_containers[bi], '_cached_person_counts', {}).get(cid, 0),
+                                    ),
+                                )
+                                old_pair_cost = local_cost(donor['length'], people[donor_idx]) + local_cost(
+                                    receiver['length'], people[receiver_idx]
+                                )
+                                for box_idx in movable:
+                                    box = all_sub_containers[box_idx]
+                                    if (receiver['weight'] + box.weight > max_weight_per_sc + 1e-6 or
+                                            receiver['length'] + box.length_unit > max_length_per_sc + 1e-6):
+                                        continue
+                                    public_type = getattr(box, '_cached_public_type', None)
+                                    if public_type is None:
+                                        public_type = get_public_box_type(box.box_type)
+                                    donor_person_boxes = donor.get('_person_box_count', 0) - (1 if public_type == 'Person' else 0)
+                                    donor_non_person_boxes = donor.get('_non_person_box_count', 0) - (0 if public_type == 'Person' else 1)
+                                    if donor_non_person_boxes > 0 and donor_person_boxes <= 0:
+                                        continue
+                                    moving_people = getattr(box, '_cached_person_counts', {}).get(cid, 0)
+                                    new_pair_cost = local_cost(
+                                        donor['length'] - box.length_unit,
+                                        people[donor_idx] - moving_people,
+                                    ) + local_cost(
+                                        receiver['length'] + box.length_unit,
+                                        people[receiver_idx] + moving_people,
+                                    )
+                                    delta = new_pair_cost - old_pair_cost
+                                    if delta < best_score - 1e-7:
+                                        best_score = delta
+                                        best = (donor_idx, receiver_idx, box_idx)
+
+                        if best is None:
+                            break
+                        donor_idx, receiver_idx, box_idx = best
+                        donor_indices = current[donor_idx].get('box_indices', [])
+                        receiver_indices = current[receiver_idx].get('box_indices', [])
+                        current[donor_idx] = make_unit(
+                            [bi for bi in donor_indices if bi != box_idx], forced_owners={cid}
+                        )
+                        current[receiver_idx] = make_unit(
+                            list(receiver_indices) + [box_idx], forced_owners={cid}
+                        )
+
+                    # 单向搬移可能受接收车剩余换长限制；再交换两个不同载员量的人员箱，
+                    # 可在几乎不改变换长的情况下继续缩小人数差距。
+                    for _ in range(min(64, max_moves)):
+                        if FAST_FEASIBLE_MODE and time.monotonic() >= local_deadline:
+                            break
+                        people = [c.get('_person_counts', {}).get(cid, 0) for c in current]
+                        high_indices = sorted(range(len(current)), key=lambda k: people[k], reverse=True)[:4]
+                        low_indices = sorted(range(len(current)), key=lambda k: people[k])[:4]
+                        best_swap = None
+                        best_delta = 0.0
+                        for high_idx in high_indices:
+                            high = current[high_idx]
+                            high_boxes = [
+                                bi for bi in high.get('box_indices', [])
+                                if getattr(all_sub_containers[bi], '_cached_public_type', None) == 'Person'
+                            ]
+                            for low_idx in low_indices:
+                                if high_idx == low_idx or people[high_idx] <= people[low_idx]:
+                                    continue
+                                low = current[low_idx]
+                                low_boxes = [
+                                    bi for bi in low.get('box_indices', [])
+                                    if getattr(all_sub_containers[bi], '_cached_public_type', None) == 'Person'
+                                ]
+                                old_pair_cost = local_cost(high['length'], people[high_idx]) + local_cost(
+                                    low['length'], people[low_idx]
+                                )
+                                for high_box_idx in high_boxes:
+                                    high_box = all_sub_containers[high_box_idx]
+                                    high_box_people = getattr(high_box, '_cached_person_counts', {}).get(cid, 0)
+                                    for low_box_idx in low_boxes:
+                                        low_box = all_sub_containers[low_box_idx]
+                                        low_box_people = getattr(low_box, '_cached_person_counts', {}).get(cid, 0)
+                                        if high_box_people <= low_box_people:
+                                            continue
+                                        new_high_weight = high['weight'] - high_box.weight + low_box.weight
+                                        new_high_length = high['length'] - high_box.length_unit + low_box.length_unit
+                                        new_low_weight = low['weight'] - low_box.weight + high_box.weight
+                                        new_low_length = low['length'] - low_box.length_unit + high_box.length_unit
+                                        if (new_high_weight > max_weight_per_sc + 1e-6 or
+                                                new_high_length > max_length_per_sc + 1e-6 or
+                                                new_low_weight > max_weight_per_sc + 1e-6 or
+                                                new_low_length > max_length_per_sc + 1e-6):
+                                            continue
+                                        new_pair_cost = local_cost(
+                                            new_high_length,
+                                            people[high_idx] - high_box_people + low_box_people,
+                                        ) + local_cost(
+                                            new_low_length,
+                                            people[low_idx] - low_box_people + high_box_people,
+                                        )
+                                        delta = new_pair_cost - old_pair_cost
+                                        if delta < best_delta - 1e-7:
+                                            best_delta = delta
+                                            best_swap = (high_idx, low_idx, high_box_idx, low_box_idx)
+                        if best_swap is None:
+                            break
+                        high_idx, low_idx, high_box_idx, low_box_idx = best_swap
+                        high_indices0 = [
+                            low_box_idx if bi == high_box_idx else bi
+                            for bi in current[high_idx].get('box_indices', [])
+                        ]
+                        low_indices0 = [
+                            high_box_idx if bi == low_box_idx else bi
+                            for bi in current[low_idx].get('box_indices', [])
+                        ]
+                        current[high_idx] = make_unit(high_indices0, forced_owners={cid})
+                        current[low_idx] = make_unit(low_indices0, forced_owners={cid})
+
+                    # 若一辆车没有余量接收人员箱，尝试“人员箱+另一小箱”与对方一至两个
+                    # 小箱成组交换。该邻域可在总换长几乎不变时处理 96/288 这类离散人数差。
+                    for _ in range(min(32, max_moves) if allow_length_moves else 0):
+                        if FAST_FEASIBLE_MODE and time.monotonic() >= local_deadline:
+                            break
+                        people = [c.get('_person_counts', {}).get(cid, 0) for c in current]
+                        high_idx = max(range(len(current)), key=lambda k: people[k])
+                        low_idx = min(range(len(current)), key=lambda k: people[k])
+                        if people[high_idx] <= people[low_idx]:
+                            break
+                        high = current[high_idx]
+                        low = current[low_idx]
+
+                        def bundle_info(chunk0, require_person=False):
+                            indices0 = list(chunk0.get('box_indices', []))
+                            person_indices0 = [
+                                bi for bi in indices0
+                                if getattr(all_sub_containers[bi], '_cached_person_counts', {}).get(cid, 0) > 0
+                            ]
+                            bundles0 = set()
+                            for bi in indices0:
+                                if not require_person or bi in person_indices0:
+                                    bundles0.add((bi,))
+                            if require_person:
+                                for p_bi in person_indices0:
+                                    for bi in indices0:
+                                        if bi != p_bi:
+                                            bundles0.add(tuple(sorted((p_bi, bi))))
+                            else:
+                                for pos0, bi in enumerate(indices0):
+                                    for bj in indices0[pos0 + 1:]:
+                                        bundles0.add(tuple(sorted((bi, bj))))
+                            result0 = []
+                            for bundle0 in bundles0:
+                                boxes0 = [all_sub_containers[bi] for bi in bundle0]
+                                result0.append((
+                                    bundle0,
+                                    sum(b.weight for b in boxes0),
+                                    sum(b.length_unit for b in boxes0),
+                                    sum(getattr(b, '_cached_person_counts', {}).get(cid, 0) for b in boxes0),
+                                    sum(1 for b in boxes0 if getattr(b, '_cached_public_type', None) == 'Person'),
+                                    sum(1 for b in boxes0 if getattr(b, '_cached_public_type', None) != 'Person'),
+                                ))
+                            return result0
+
+                        high_bundles = bundle_info(high, require_person=True)
+                        low_bundles = bundle_info(low, require_person=False)
+                        old_pair_cost = local_cost(high['length'], people[high_idx]) + local_cost(
+                            low['length'], people[low_idx]
+                        )
+                        best_bundle_swap = None
+                        best_delta = 0.0
+                        for high_bundle, high_w, high_l, high_p, high_pb, high_npb in high_bundles:
+                            for low_bundle, low_w, low_l, low_p, low_pb, low_npb in low_bundles:
+                                if high_p <= low_p:
+                                    continue
+                                new_high_w = high['weight'] - high_w + low_w
+                                new_high_l = high['length'] - high_l + low_l
+                                new_low_w = low['weight'] - low_w + high_w
+                                new_low_l = low['length'] - low_l + high_l
+                                if (new_high_w > max_weight_per_sc + 1e-6 or
+                                        new_high_l > max_length_per_sc + 1e-6 or
+                                        new_low_w > max_weight_per_sc + 1e-6 or
+                                        new_low_l > max_length_per_sc + 1e-6):
+                                    continue
+                                new_high_pb = high.get('_person_box_count', 0) - high_pb + low_pb
+                                new_high_npb = high.get('_non_person_box_count', 0) - high_npb + low_npb
+                                new_low_pb = low.get('_person_box_count', 0) - low_pb + high_pb
+                                new_low_npb = low.get('_non_person_box_count', 0) - low_npb + high_npb
+                                if ((new_high_npb > 0 and new_high_pb <= 0) or
+                                        (new_low_npb > 0 and new_low_pb <= 0)):
+                                    continue
+                                new_pair_cost = local_cost(
+                                    new_high_l, people[high_idx] - high_p + low_p
+                                ) + local_cost(
+                                    new_low_l, people[low_idx] - low_p + high_p
+                                )
+                                delta = new_pair_cost - old_pair_cost
+                                if delta < best_delta - 1e-7:
+                                    best_delta = delta
+                                    best_bundle_swap = (high_bundle, low_bundle)
+                        if best_bundle_swap is None:
+                            break
+                        high_bundle, low_bundle = best_bundle_swap
+                        high_remove = set(high_bundle)
+                        low_remove = set(low_bundle)
+                        new_high_indices = [
+                            bi for bi in high.get('box_indices', []) if bi not in high_remove
+                        ] + list(low_bundle)
+                        new_low_indices = [
+                            bi for bi in low.get('box_indices', []) if bi not in low_remove
+                        ] + list(high_bundle)
+                        current[high_idx] = make_unit(new_high_indices, forced_owners={cid})
+                        current[low_idx] = make_unit(new_low_indices, forced_owners={cid})
+                    company_balance_spent += time.monotonic() - balance_started
+                    return current
+
+                def chunks_balance_summary(chunks):
+                    lengths = [c['length'] for c in chunks]
+                    people = [c.get('_person_counts', {}).get(cid, 0) for c in chunks]
+                    below = sum(1 for value in lengths if value < max_length_per_sc * BALANCE_MIN_LENGTH_RATIO - 1e-6)
+                    return (
+                        f"n={len(chunks)}, min={min(lengths):.2f}, max={max(lengths):.2f}, "
+                        f"below90%={below}, person_gap={max(people) - min(people) if people else 0}"
+                    )
 
                 def build_exact_with_target_count(target_count):
                     """用 MILP 精确寻找指定装车单元数的可行分配。
@@ -2755,6 +3266,17 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         else:
                             last_error = err
 
+                    if FAST_FEASIBLE_MODE and best_chunks is not None:
+                        # 在理论车辆数从小到大的第一个可行层，只比较原有四种排序策略，
+                        # 再在固定车辆数内执行有时间上限的整箱搬移；不枚举更多车辆数。
+                        best_chunks = rebalance_company_chunks_fast(best_chunks)
+                        print(
+                            f"公司 {company_name.get(cid, cid)}({cid}) 人-物同车打包完成："
+                            f"target_count={best_target_count}, strategy={best_strategy}, fast_feasible=True, "
+                            f"{chunks_balance_summary(best_chunks)}"
+                        )
+                        return best_chunks
+
                     # 若已经达到最低车辆数且所有块换长均不低于目标下限，可提前结束；
                     # 否则继续看多一个混合块是否能显著改善均衡。
                     if best_chunks is not None and best_target_count == lower_count:
@@ -2781,10 +3303,12 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                         last_error = '；'.join(exact_errors[-3:])
 
                 if best_chunks is not None:
+                    if FAST_FEASIBLE_MODE:
+                        best_chunks = rebalance_company_chunks_fast(best_chunks)
                     print(
                         f"公司 {company_name.get(cid, cid)}({cid}) 人-物同车打包完成："
                         f"target_count={best_target_count}, strategy={best_strategy}, "
-                        f"换长={[round(c['length'], 2) for c in best_chunks]}"
+                        f"{chunks_balance_summary(best_chunks)}"
                     )
                     return best_chunks
 
@@ -2795,7 +3319,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
             person_indices = [i for i in box_indices if get_public_box_type(all_sub_containers[i].box_type) == 'Person']
-            non_person_indices = [i for i in box_indices if i not in set(person_indices)]
+            person_index_set = set(person_indices)
+            non_person_indices = [i for i in box_indices if i not in person_index_set]
 
             # 只要同一公司同时存在人员和物资/装备，就启用均衡打包，而不是只在人员接近一整车时才启用。
             if person_indices and non_person_indices:
@@ -2803,12 +3328,15 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
             # 只有单一类型时，保留原有压缩装车逻辑。
             chao_indices = [i for i in non_person_indices if box_has_chaoxian_equipment(all_sub_containers[i])]
-            normal_non_person_indices = [i for i in non_person_indices if i not in set(chao_indices)]
+            chao_index_set = set(chao_indices)
+            normal_non_person_indices = [i for i in non_person_indices if i not in chao_index_set]
             chunks = []
             chunks = pack_indices(chunks, chao_indices, prefer_chao_chunk=True)
             chunks = pack_indices(chunks, normal_non_person_indices + person_indices, prefer_chao_chunk=False)
             return chunks
 
+        # 公司内整箱搬移累计使用严格预算，数据量再大也不会因软均衡无限延长。
+        company_balance_spent = 0.0
         for cid, box_indices in indices_by_company.items():
             total_w = sum(all_sub_containers[i].weight for i in box_indices)
             total_l = sum(all_sub_containers[i].length_unit for i in box_indices)
@@ -3031,7 +3559,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             range_penalty = max(0.0, (max(lengths) - min(lengths)) - allowed_gap) ** 2
             full_range_penalty = (max(lengths) - min(lengths)) ** 2 if len(lengths) > 1 else 0.0
             weight_range_penalty = (max(weights) - min(weights)) ** 2 / max(max_weight_per_sc, 1.0) if len(weights) > 1 else 0.0
-            return 7.50 * under_penalty + 1.15 * target_penalty + 2.20 * range_penalty + 0.35 * full_range_penalty + 0.04 * weight_range_penalty
+            return 12.00 * under_penalty + 1.15 * target_penalty + 4.00 * range_penalty + 0.60 * full_range_penalty + 0.04 * weight_range_penalty
 
         def _people_penalty_for_counts(counts):
             """与 company_people_distribution_penalty 中单公司公式完全一致。"""
@@ -3055,18 +3583,40 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             """
             __slots__ = (
                 'vehicles', 'company_order', 'people_contrib', 'spread_contrib',
-                'people_total', 'spread_total'
+                'people_total', 'spread_total', 'lengths', 'weights',
+                'length_order', 'weight_order', 'active_count',
+                'under_total', 'target_total'
             )
 
             def __init__(self, vehicles):
                 self.vehicles = vehicles
                 self.company_order = tuple(company_name.keys())
+                self.lengths = tuple(v.length for v in vehicles)
+                self.weights = tuple(v.weight for v in vehicles)
+                self.length_order = tuple(sorted(range(len(vehicles)), key=self.lengths.__getitem__))
+                self.weight_order = tuple(sorted(range(len(vehicles)), key=self.weights.__getitem__))
+                self.active_count = sum(1 for v in vehicles if v.units)
+                target_l = max_length_per_sc * BALANCE_TARGET_LENGTH_RATIO
+                min_target_l = max_length_per_sc * BALANCE_MIN_LENGTH_RATIO
+                self.under_total = sum(
+                    max(0.0, min_target_l - v.length) ** 2 for v in vehicles if v.units
+                )
+                self.target_total = sum(
+                    (v.length - target_l) ** 2 for v in vehicles if v.units
+                )
                 self.people_contrib = {}
                 self.spread_contrib = {}
+                counts_by_company = defaultdict(list)
+                vehicle_count_by_company = defaultdict(int)
+                # 与原来的“每个公司扫描全部车辆”等价；改为单次扫描车辆成员关系。
+                for vehicle in vehicles:
+                    for cid0 in vehicle.companies:
+                        counts_by_company[cid0].append(vehicle._person_counts.get(cid0, 0))
+                        vehicle_count_by_company[cid0] += 1
                 for cid0 in self.company_order:
-                    counts = [v._person_counts.get(cid0, 0) for v in vehicles if cid0 in v.companies]
+                    counts = counts_by_company.get(cid0, ())
                     self.people_contrib[cid0] = _people_penalty_for_counts(counts)
-                    vehicle_count = sum(1 for v in vehicles if cid0 in v.companies)
+                    vehicle_count = vehicle_count_by_company.get(cid0, 0)
                     self.spread_contrib[cid0] = (vehicle_count - 1) ** 2 if vehicle_count > 1 else 0.0
                 # 保持原公司顺序累加。
                 people_total = 0.0
@@ -3108,10 +3658,74 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     spread_total += new_value - self.spread_contrib[cid0]
                 return people_total, spread_total
 
-            def objective(self, candidate, affected):
+            def fleet_objective_after_move(self, candidate, changed_indices):
+                """增量计算 fleet_balance_objective。
+
+                一次候选只会改变供给车和接收车，换长/重量平方项无需再遍历整支车队；
+                最大/最小值仅在被修改的车辆原本处于边界时回看一次排序索引。
+                计算公式与 fleet_balance_objective 保持一致。
+                """
+                changed = set(changed_indices or ())
+                if not changed:
+                    return fleet_balance_objective(candidate)
+
+                target_l = max_length_per_sc * BALANCE_TARGET_LENGTH_RATIO
+                min_target_l = max_length_per_sc * BALANCE_MIN_LENGTH_RATIO
+                allowed_gap = max_length_per_sc * BALANCE_MAX_GAP_RATIO
+                under_total = self.under_total
+                target_total = self.target_total
+                active_count = self.active_count
+                for idx in changed:
+                    if idx < 0 or idx >= len(self.vehicles):
+                        return fleet_balance_objective(candidate)
+                    old = self.vehicles[idx]
+                    new = candidate[idx]
+                    if old.units:
+                        under_total -= max(0.0, min_target_l - old.length) ** 2
+                        target_total -= (old.length - target_l) ** 2
+                    if new.units:
+                        under_total += max(0.0, min_target_l - new.length) ** 2
+                        target_total += (new.length - target_l) ** 2
+                    if bool(old.units) != bool(new.units):
+                        active_count += 1 if new.units else -1
+
+                if active_count <= 0:
+                    return 0.0
+
+                changed_active = {idx for idx in changed if candidate[idx].units}
+
+                def unchanged_extreme(values, order, want_max=False):
+                    iterable = reversed(order) if want_max else order
+                    for idx in iterable:
+                        if idx not in changed and self.vehicles[idx].units:
+                            return values[idx]
+                    return None
+
+                min_l = unchanged_extreme(self.lengths, self.length_order)
+                max_l = unchanged_extreme(self.lengths, self.length_order, want_max=True)
+                min_w = unchanged_extreme(self.weights, self.weight_order)
+                max_w = unchanged_extreme(self.weights, self.weight_order, want_max=True)
+                for idx in changed_active:
+                    value_l = candidate[idx].length
+                    value_w = candidate[idx].weight
+                    min_l = value_l if min_l is None else min(min_l, value_l)
+                    max_l = value_l if max_l is None else max(max_l, value_l)
+                    min_w = value_w if min_w is None else min(min_w, value_w)
+                    max_w = value_w if max_w is None else max(max_w, value_w)
+
+                range_width = max_l - min_l
+                return (
+                    12.00 * under_total
+                    + 1.15 * target_total / max(1, active_count)
+                    + 4.00 * max(0.0, range_width - allowed_gap) ** 2
+                    + 0.60 * range_width ** 2
+                    + 0.04 * (max_w - min_w) ** 2 / max(max_weight_per_sc, 1.0)
+                )
+
+            def objective(self, candidate, affected, changed_indices=None):
                 people_penalty, spread_penalty = self.penalties(candidate, affected)
                 return (
-                    fleet_balance_objective(candidate)
+                    self.fleet_objective_after_move(candidate, changed_indices)
                     + PERSON_BALANCE_WEIGHT * (max_length_per_sc ** 2) * people_penalty
                     + COMPANY_SPREAD_WEIGHT * (max_length_per_sc ** 2) * spread_penalty
                 )
@@ -3177,7 +3791,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
                 for receiver_idx in under_order:
                     if balance_budget_exhausted():
-                        return vehicles_local
+                        # 保留本轮已经找到的最佳候选，再退出本轮搜索。
+                        break
                     receiver = vehicles_local[receiver_idx]
                     # 低于目标下限，或全局最大/最小换长差距过大时才主动补车。
                     need_fill = (
@@ -3191,7 +3806,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     for prefer_same_company in (True, False):
                         for donor_idx, donor in enumerate(vehicles_local):
                             if balance_budget_exhausted():
-                                return vehicles_local
+                                # 退出当前候选扫描；外层会采用已找到的最佳改进。
+                                break
                             if donor_idx == receiver_idx or donor.length <= receiver.length + 1e-6:
                                 continue
                             donor_units = donor_units_cache.get(donor_idx)
@@ -3294,7 +3910,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                         vehicles_local[donor_idx], vehicles_local[receiver_idx],
                                         candidate[donor_idx], candidate[receiver_idx]
                                     )
-                                    new_score = objective_cache.objective(candidate, affected)
+                                    new_score = objective_cache.objective(
+                                        candidate, affected, (donor_idx, receiver_idx)
+                                    )
                                     candidate = [v for v in candidate if v.units]
                                     # 同公司搬移优先；跨公司搬移必须在补换长/少浪费方面带来更明确收益，且评分会惩罚公司过度分散。
                                     improvement_tol = 1e-7 if same_company else 5e-4
@@ -3365,7 +3983,8 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
                 for cid0 in company_name.keys():
                     if balance_budget_exhausted():
-                        return vehicles_local
+                        # 保留本轮已经找到的最佳候选，再退出本轮搜索。
+                        break
                     counts = company_vehicle_counts(vehicles_local, cid0)
                     if not people_gap_needs_fix(counts):
                         continue
@@ -3425,13 +4044,24 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                                 candidate[receiver_idx].place(moving_unit, company_yingji_name)
                                 if not valid_after_move(candidate, donor_idx, receiver_idx):
                                     continue
+                                min_length_target = max_length_per_sc * BALANCE_MIN_LENGTH_RATIO
+                                if any(
+                                    vehicles_local[vi].length >= min_length_target - 1e-6
+                                    and candidate[vi].units
+                                    and candidate[vi].length < min_length_target - 1e-6
+                                    for vi in (donor_idx, receiver_idx)
+                                ):
+                                    # 人数改善不能把原本已达90%的车降成短车。
+                                    continue
                                 affected = objective_cache.affected_companies(
                                     vehicles_local[donor_idx], vehicles_local[receiver_idx],
                                     candidate[donor_idx], candidate[receiver_idx]
                                 )
                                 new_people_penalty, new_spread_penalty = objective_cache.penalties(candidate, affected)
                                 new_score = (
-                                    fleet_balance_objective(candidate)
+                                    objective_cache.fleet_objective_after_move(
+                                        candidate, (donor_idx, receiver_idx)
+                                    )
                                     + PERSON_BALANCE_WEIGHT * (max_length_per_sc ** 2) * new_people_penalty
                                     + COMPANY_SPREAD_WEIGHT * (max_length_per_sc ** 2) * new_spread_penalty
                                 )
@@ -3450,40 +4080,58 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
             return vehicles_local
 
-        # 多轮执行“压缩车辆数 -> 换长均衡 -> 公司人员均衡”。
-        # 先尽量少用车，再在不增加车辆数、不破坏硬约束的前提下把尾车换长补起来。
-        last_signature = None
-        for _balance_round in range(BALANCE_MAX_ROUNDS):
-            if balance_budget_exhausted():
-                break
+        if FAST_FEASIBLE_MODE:
+            # 完整装车单元已经满足硬规则。先压缩车辆数，再分别给换长和人数均衡
+            # 独立的短时预算；两个阶段即使超时也会保留本轮已找到的最佳合规改进。
             vehicles = compact_vehicles(vehicles)
+            balance_deadline = time.monotonic() + FAST_LENGTH_BALANCE_SECONDS
             vehicles = balance_vehicles_by_unit_moves(vehicles)
+            balance_deadline = time.monotonic() + FAST_PEOPLE_BALANCE_SECONDS
             vehicles = balance_company_people_distribution(vehicles)
-            signature = (
-                len(vehicles),
-                tuple(sorted(round(v.length, 3) for v in vehicles)),
-                tuple(sorted(round(v.weight, 3) for v in vehicles)),
-            )
-            if signature == last_signature:
-                break
-            last_signature = signature
-        # 均衡后再尝试一次压缩；如压缩成功，再做一次均衡，避免新尾车过小。
-        before_count = len(vehicles)
-        if not balance_budget_exhausted():
-            vehicles = compact_vehicles(vehicles)
-        if len(vehicles) < before_count and not balance_budget_exhausted():
-            vehicles = balance_vehicles_by_unit_moves(vehicles)
-            vehicles = balance_company_people_distribution(vehicles)
+        else:
+            # 可选质量模式：多轮执行“压缩车辆数 -> 换长均衡 -> 公司人员均衡”。
+            last_signature = None
+            for _balance_round in range(BALANCE_MAX_ROUNDS):
+                if balance_budget_exhausted():
+                    break
+                vehicles = compact_vehicles(vehicles)
+                vehicles = balance_vehicles_by_unit_moves(vehicles)
+                vehicles = balance_company_people_distribution(vehicles)
+                signature = (
+                    len(vehicles),
+                    tuple(sorted(round(v.length, 3) for v in vehicles)),
+                    tuple(sorted(round(v.weight, 3) for v in vehicles)),
+                )
+                if signature == last_signature:
+                    break
+                last_signature = signature
+            # 均衡后再尝试一次压缩；如压缩成功，再做一次均衡，避免新尾车过小。
+            before_count = len(vehicles)
+            if not balance_budget_exhausted():
+                vehicles = compact_vehicles(vehicles)
+            if len(vehicles) < before_count and not balance_budget_exhausted():
+                vehicles = balance_vehicles_by_unit_moves(vehicles)
+                vehicles = balance_company_people_distribution(vehicles)
         total_sc_used = len(vehicles)
         balance_elapsed = time.monotonic() - balance_started_at
         budget_note = '（已达软均衡时间预算）' if balance_budget_exhausted() else ''
         print(
             f"启发式装车完成，使用 SC 总数: {total_sc_used}，"
-            f"车辆软均衡耗时: {balance_elapsed:.3f}秒{budget_note}"
+            f"车辆后处理耗时: {balance_elapsed:.3f}秒{budget_note}"
         )
         if vehicles:
             lengths_after_balance = [round(v.length, 2) for v in vehicles]
-            print(f"车辆换长均衡结果: min={min(lengths_after_balance):.2f}, max={max(lengths_after_balance):.2f}, values={lengths_after_balance}")
+            below_target = sum(
+                1 for value in lengths_after_balance
+                if value < max_length_per_sc * BALANCE_MIN_LENGTH_RATIO - 1e-6
+            )
+            preview = lengths_after_balance[:20]
+            preview_note = '' if len(lengths_after_balance) <= 20 else f", ... 共{len(lengths_after_balance)}辆"
+            print(
+                f"车辆换长均衡结果: min={min(lengths_after_balance):.2f}, "
+                f"max={max(lengths_after_balance):.2f}, below90%={below_target}, "
+                f"preview={preview}{preview_note}"
+            )
 
         heuristic_assign = [-1] * len(all_sub_containers)
         for v, vehicle in enumerate(vehicles):
@@ -3553,7 +4201,9 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             if split_companies:
                 print("提示：以下公司因容量/装载组合原因被分到多辆车（软约束，已尽量压缩）：")
                 for cid, vs in list(split_companies.items())[:20]:
-                    print(f"  {cid}: {len(vs)} 辆 -> {[f'SC_{v + 1:03d}' for v in vs]}")
+                    sc_preview = [f'SC_{v + 1:03d}' for v in vs[:12]]
+                    sc_note = '' if len(vs) <= 12 else f' ... 共{len(vs)}辆'
+                    print(f"  {cid}: {len(vs)} 辆 -> {sc_preview}{sc_note}")
                 if len(split_companies) > 20:
                     print(f"  ... 共 {len(split_companies)} 个公司")
 
@@ -3618,51 +4268,46 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 item['tj'] = vol
                 item['zhuangZai'] = item.get('zhuangZai', zhuang_zai) or zhuang_zai
 
-                best_box = None
-                best_score = None
-                for box in open_large_repacked[zzsbid]:
-                    if box.capacity_type != 'component_pack':
-                        continue
-                    if getattr(box, 'goods_closed', False):
-                        continue
-                    if not can_pack_component_item(box, item, company_yingji_name, zjdh_forbid_matrix):
-                        continue
-                    if box.goods_item_counts[c_key] + 1 > item_limit:
-                        continue
-                    # Large不按sbrl/sbzz判断；只按同zzsbid、尾数拼箱、zzsbidNumber、占用比例和yingjiName规则。
-                    new_load_ratio = (box.current_load + occupancy) / box.max_capacity if box.max_capacity else 1.0
-                    count_ratio = (box.goods_item_counts[c_key] + 1) / item_limit if item_limit else 1.0
-                    owner_bonus = 0.08 if cid in box.owners else 0.0
-                    chao_bonus = 0.10 if normalize_is_chaoxian(item.get('is_chaoXian', '')) == '是' else 0.0
-                    tail_bonus = 0.08 if item.get('_component_tail_candidate') else 0.0
-                    score = 0.80 * new_load_ratio + 0.12 * count_ratio + owner_bonus + chao_bonus + tail_bonus
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best_box = box
+                remaining_quantity = safe_int(item.get('_batch_count', 1), 1)
+                while remaining_quantity > 0:
+                    best_box = None
+                    best_score = None
+                    for box in open_large_repacked[zzsbid]:
+                        if box.capacity_type != 'component_pack' or getattr(box, 'goods_closed', False):
+                            continue
+                        if not can_pack_component_item(box, item, company_yingji_name, zjdh_forbid_matrix):
+                            continue
+                        if box.goods_item_counts[c_key] + 1 > item_limit:
+                            continue
+                        new_load_ratio = (box.current_load + occupancy) / box.max_capacity if box.max_capacity else 1.0
+                        count_ratio = (box.goods_item_counts[c_key] + 1) / item_limit if item_limit else 1.0
+                        owner_bonus = 0.08 if cid in box.owners else 0.0
+                        chao_bonus = 0.10 if normalize_is_chaoxian(item.get('is_chaoXian', '')) == '是' else 0.0
+                        tail_bonus = 0.08 if item.get('_component_tail_candidate') else 0.0
+                        score = 0.80 * new_load_ratio + 0.12 * count_ratio + owner_bonus + chao_bonus + tail_bonus
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_box = box
 
-                if best_box is None:
-                    new_box = SubContainer(
-                        'Large',
-                        spec['sbhc'],
-                        spec['sbzl'],
-                        1.0,
-                        'component_pack',
-                        zzsbid=zzsbid,
-                        zhuang_zai=zhuang_zai,
-                    )
-                    # Large不使用sbrl/sbzz作为拼箱限制；这里设为极大值，仅保留SC总重/总换长校验。
-                    new_box.max_payload = 999999999.0
-                    new_box.max_volume = 999999999.0
-                    if not new_box.add_item(cid, item, w, occupancy, item_volume=vol):
-                        raise AlgorithmError(
-                            f'装备 {name or comp_id} 在SC内Large重装失败：zzsbid={zzsbid}, 请检查zzsbidNumber或尾数拼箱规则'
+                    if best_box is None:
+                        best_box = SubContainer(
+                            'Large', spec['sbhc'], spec['sbzl'], 1.0, 'component_pack',
+                            zzsbid=zzsbid, zhuang_zai=zhuang_zai,
                         )
-                    if not getattr(new_box, 'goods_closed', False):
-                        open_large_repacked[zzsbid].append(new_box)
-                    virtual_boxes.append((None, new_box))
-                else:
-                    if not best_box.add_item(cid, item, w, occupancy, item_volume=vol):
-                        raise AlgorithmError(f'装备 {name or comp_id} 在SC内Large混装失败')
+                        best_box.max_payload = 999999999.0
+                        best_box.max_volume = 999999999.0
+                        open_large_repacked[zzsbid].append(best_box)
+                        virtual_boxes.append((None, best_box))
+
+                    count_space = item_limit - best_box.goods_item_counts[c_key]
+                    load_space = int(math.floor(
+                        (best_box.max_capacity - best_box.current_load + 1e-6) / occupancy
+                    )) if occupancy > 0 else remaining_quantity
+                    to_add = min(remaining_quantity, count_space, load_space)
+                    if to_add <= 0 or not best_box.add_item(
+                            cid, item, w, occupancy, item_volume=vol, quantity=to_add):
+                        raise AlgorithmError(f'装备 {name or comp_id} 在SC内Large批量重装失败')
+                    remaining_quantity -= to_add
                     if getattr(best_box, 'goods_closed', False):
                         open_large_repacked[zzsbid].remove(best_box)
 
@@ -3688,56 +4333,54 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 item['_goods_tail_candidate'] = bool(item.get('_goods_tail_candidate', False))
                 item['zhuangZai'] = item.get('zhuangZai', zhuang_zai) or zhuang_zai
 
-                best_box = None
-                best_score = None
-                for box in open_repacked[zzsbid]:
-                    if box.capacity_type != 'goods_pack':
-                        continue
-                    if getattr(box, 'goods_closed', False):
-                        continue
-                    if not can_pack_goods_item(box, item, company_yingji_name, zjdh_forbid_matrix):
-                        continue
-                    if box.goods_item_counts[g_key] + 1 > item_limit:
-                        continue
-                    if box.current_volume + tj > box.max_volume + 1e-6:
-                        continue
-                    if box.current_payload + w > box.max_payload + 1e-6:
-                        continue
+                remaining_quantity = safe_int(item.get('_batch_count', 1), 1)
+                while remaining_quantity > 0:
+                    best_box = None
+                    best_score = None
+                    for box in open_repacked[zzsbid]:
+                        if box.capacity_type != 'goods_pack' or getattr(box, 'goods_closed', False):
+                            continue
+                        if not can_pack_goods_item(box, item, company_yingji_name, zjdh_forbid_matrix):
+                            continue
+                        if box.goods_item_counts[g_key] + 1 > item_limit:
+                            continue
+                        if box.current_volume + tj > box.max_volume + 1e-6:
+                            continue
+                        if box.current_payload + w > box.max_payload + 1e-6:
+                            continue
 
-                    new_volume = box.current_volume + tj
-                    new_payload = box.current_payload + w
-                    vol_ratio = new_volume / box.max_volume if box.max_volume else 0.0
-                    wt_ratio = new_payload / box.max_payload if box.max_payload else 0.0
-                    owner_bonus = 0.08 if cid in box.owners else 0.0
-                    # 已经同SC后，允许跨公司混装；优先选装后更满的小车。
-                    score = 0.65 * max(vol_ratio, wt_ratio) + 0.25 * min(vol_ratio, wt_ratio) + owner_bonus
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best_box = box
+                        new_volume = box.current_volume + tj
+                        new_payload = box.current_payload + w
+                        vol_ratio = new_volume / box.max_volume if box.max_volume else 0.0
+                        wt_ratio = new_payload / box.max_payload if box.max_payload else 0.0
+                        owner_bonus = 0.08 if cid in box.owners else 0.0
+                        score = 0.65 * max(vol_ratio, wt_ratio) + 0.25 * min(vol_ratio, wt_ratio) + owner_bonus
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_box = box
 
-                if best_box is None:
-                    new_box = SubContainer(
-                        'Small',
-                        spec['sbhc'],
-                        spec['sbzl'],
-                        1.0,
-                        'goods_pack',
-                        category=None,
-                        zzsbid=zzsbid,
-                        zhuang_zai=zhuang_zai,
-                    )
-                    new_box.max_payload = spec.get('sbzz') if spec.get('sbzz', 0) > 0 else 999999999.0
-                    new_box.max_volume = spec.get('sbrl') if spec.get('sbrl', 0) > 0 else 999999999.0
-                    if not new_box.add_item(cid, item, w, 0.0, item_volume=tj):
-                        raise AlgorithmError(
-                            f'物资 {name or gid} 在SC内重装失败：weight={w:.1f}, tj={tj:.2f}, zzsbid={zzsbid}'
+                    if best_box is None:
+                        best_box = SubContainer(
+                            'Small', spec['sbhc'], spec['sbzl'], 1.0, 'goods_pack',
+                            category=None, zzsbid=zzsbid, zhuang_zai=zhuang_zai,
                         )
-                    if not getattr(new_box, 'goods_closed', False):
-                        open_repacked[zzsbid].append(new_box)
-                    virtual_boxes.append((None, new_box))
-                else:
-                    if not best_box.add_item(cid, item, w, 0.0, item_volume=tj):
-                        raise AlgorithmError(f'物资 {name or gid} 在SC内混装失败')
+                        best_box.max_payload = spec.get('sbzz') if spec.get('sbzz', 0) > 0 else 999999999.0
+                        best_box.max_volume = spec.get('sbrl') if spec.get('sbrl', 0) > 0 else 999999999.0
+                        open_repacked[zzsbid].append(best_box)
+                        virtual_boxes.append((None, best_box))
+
+                    count_space = item_limit - best_box.goods_item_counts[g_key]
+                    volume_space = int(math.floor(
+                        (best_box.max_volume - best_box.current_volume + 1e-6) / tj
+                    )) if tj > 0 else remaining_quantity
+                    payload_space = int(math.floor(
+                        (best_box.max_payload - best_box.current_payload + 1e-6) / w
+                    )) if w > 0 else remaining_quantity
+                    to_add = min(remaining_quantity, count_space, volume_space, payload_space)
+                    if to_add <= 0 or not best_box.add_item(
+                            cid, item, w, 0.0, item_volume=tj, quantity=to_add):
+                        raise AlgorithmError(f'物资 {name or gid} 在SC内批量重装失败')
+                    remaining_quantity -= to_add
                     if getattr(best_box, 'goods_closed', False):
                         open_repacked[zzsbid].remove(best_box)
 
@@ -3774,8 +4417,26 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 for orig_idx in merge_map[i]:
                     sc_source_boxes.append((orig_idx, original_boxes[orig_idx]))
 
-            # 只有在同一SC内部，才允许不同公司的Large/Small按各自规则二次重装；Person人员箱保持原箱，不跨公司拼箱。
-            output_boxes = repack_large_and_small_boxes_within_sc(sc_source_boxes)
+            # 跨公司二次混装属于可选压缩。快速模式保留已经合规的原箱，既避免输出阶段
+            # 再做一次大规模装箱，也杜绝尾数重算后箱数增加、反向造成SC超限。
+            output_boxes = (
+                sc_source_boxes if FAST_FEASIBLE_MODE
+                else repack_large_and_small_boxes_within_sc(sc_source_boxes)
+            )
+            repacked_weight = sum(box.weight for _idx, box in output_boxes)
+            repacked_length = sum(box.length_unit for _idx, box in output_boxes)
+            if (repacked_weight > max_weight_per_sc + 1e-6 or
+                    repacked_length > max_length_per_sc + 1e-6):
+                # 跨公司二次重装是可选压缩，不是硬规则。某些尾数/zjdh组合会让重装后
+                # 箱数反而增加；此时恢复已经通过车辆容量检查的原箱，保证可行方案可返回。
+                logger.info(
+                    "SC_%03d 二次重装将导致容量超限，使用重装前合规方案: "
+                    "weight=%.1f, length=%.2f",
+                    v + 1,
+                    repacked_weight,
+                    repacked_length,
+                )
+                output_boxes = sc_source_boxes
 
             virtual_counter = 1
             for orig_idx, orig_box in output_boxes:
