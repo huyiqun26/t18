@@ -42,7 +42,7 @@ SERVER_MONITOR_INTERVAL = 5.0
 # 若部署机容量足够，可由运维显式设置 RAILWAY_ALGO_WORKERS=2..4 提高吞吐。
 MAX_ALGO_WORKERS = max(1, min(4, int(os.getenv('RAILWAY_ALGO_WORKERS', '1'))))
 REQUEST_TIMEOUT_SECONDS = None  # 兼容保留：接口已取消固定超时，不参与运行
-BUILD_VERSION = "2026-10-11-linux-v15-batch-log-fix"
+BUILD_VERSION = "2026-09-03-linux-v14-fast-feasible"
 
 # 默认目标：尽快返回一组满足全部硬规则的可行解。下列换长、人数、公司分散度均为
 # 原代码已经声明的软目标；FAST_FEASIBLE_MODE 只停止这些软目标的反复择优，不跳过
@@ -1132,34 +1132,28 @@ class VehicleState:
                 self._person_counts.pop(cid, None)
 
 
-def input_fingerprint(raw_data):
-    """为本次实际输入生成稳定指纹，用于核对“同一任务是否真的是同一份入参”。"""
-    normalized = json.dumps(
-        {'systemSettings': raw_data.get('systemSettings', {}), 'data': raw_data.get('data', [])},
-        sort_keys=True, ensure_ascii=False, separators=(',', ':'),
-    )
-    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
-
-
 def resolve_task_id(raw_data):
     task_id = raw_data.get('taskID')
     if task_id is not None and str(task_id).strip():
         return task_id
-    return 'AUTO_' + input_fingerprint(raw_data)
+    # 仅使用任务输入生成稳定标识，保留列表顺序。
+    normalized = json.dumps(
+        {'systemSettings': raw_data.get('systemSettings', {}), 'data': raw_data.get('data', [])},
+        sort_keys=True, ensure_ascii=False, separators=(',', ':'),
+    )
+    return 'AUTO_' + hashlib.sha256(normalized.encode('utf-8')).hexdigest()
 
 
 def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
     task_id = ''
-    input_hash = ''
     current_organization_id = None
     try:
-        input_hash = input_fingerprint(raw_data)
         task_id = resolve_task_id(raw_data)
         companies = raw_data.get('data', [])
         organization_ids = [comp.get('organizationID', '') for comp in companies]
         logger.info(
-            "计算开始 taskID=%s inputHash=%s organizationID=%s 单位数量=%s",
-            task_id, input_hash[:16], organization_ids, len(companies),
+            "计算开始 taskID=%s organizationID=%s 单位数量=%s",
+            task_id, organization_ids, len(companies),
         )
         sys_settings = raw_data.get('systemSettings', {})
         sc_limit = sys_settings.get('SC_Constraint', {'maxWeightLimit': 60000, 'maxLengthLimit': 800.0})
@@ -1380,7 +1374,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     if to_add <= 0 or not best_box.add_item(
                             cid, item_info, w, occupancy, item_volume=vol, quantity=to_add):
                         raise AlgorithmError(
-                            f'装备 {name or comp_id} Large批量装入失败：organizationID={cid}, bddxid={item.get("bddxid", "")}, zzsbid={zzsbid}, '
+                            f'装备 {name or comp_id} Large批量装入失败：zzsbid={zzsbid}, '
                             f'请检查zzsbidNumber或尾数拼箱规则'
                         )
                     remaining_quantity -= to_add
@@ -1408,7 +1402,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     overload_reasons.append('单件体积超过车辆容积限额')
                 if overload_reasons:
                     raise AlgorithmError(
-                        f'Small物资单件预检失败：organizationID={cid}, bddxid={item.get("bddxid", "")}, 物资={name or gid}, ID={gid}, '
+                        f'Small物资单件预检失败：organizationID={cid}, 物资={name or gid}, ID={gid}, '
                         f'zzsbid={spec.get("id", "")}, weight={w}, tj={tj}, sbzz={sbzz}, sbrl={sbrl}, '
                         f'原因={"; ".join(overload_reasons)}'
                     )
@@ -1504,7 +1498,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     if to_add <= 0 or not best_box.add_item(
                             cid, item_info, w, 0.0, item_volume=tj, quantity=to_add):
                         raise AlgorithmError(
-                            f'物资 {name or gid} 批量装入失败：organizationID={cid}, bddxid={item.get("bddxid", "")}, weight={w:.1f}, tj={tj:.2f}, '
+                            f'物资 {name or gid} 批量装入失败：weight={w:.1f}, tj={tj:.2f}, '
                             f'zzsbid={zzsbid}, sbzz={best_box.max_payload:.1f}, sbrl={best_box.max_volume:.2f}'
                         )
                     remaining_quantity -= to_add
@@ -4473,6 +4467,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 "SC_list": []
             }
         }
+        raw_boxes_by_sc = {}
 
         assigned_indices_by_vehicle = [[] for _ in range(total_sc_used)]
         for idx0, assign0 in enumerate(heuristic_assign):
@@ -4484,6 +4479,7 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 "summary": {},
                 "box_list": []
             }
+            raw_boxes_by_sc[sc_info['SC_ID']] = []
 
             owners_set = set()
             curr_w = 0.0
@@ -4520,8 +4516,6 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             virtual_counter = 1
             for orig_idx, orig_box in output_boxes:
                 owners_set.update(orig_box.owners)
-                curr_w += orig_box.weight
-                curr_l += orig_box.length_unit
                 if orig_box.is_mixed:
                     has_mixed = True
 
@@ -4558,6 +4552,10 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     box_dict["category"] = ';'.join(categories) if categories else '未分类'
 
                 sc_info["box_list"].append(box_dict)
+                # 汇总与箱明细采用相同精度，原始数值保留用于容量校验。
+                curr_w += box_dict['weight']
+                curr_l += box_dict['length_unit']
+                raw_boxes_by_sc[sc_info['SC_ID']].append((orig_box.weight, orig_box.length_unit))
 
             yingji_names_in_sc = sorted({
                 company_yingji_name.get(cid, '') for cid in owners_set
@@ -4591,24 +4589,28 @@ def run_engine(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
             res_data["data"]["SC_list"].append(sc_info)
 
-        validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max_length_per_sc, zjdh_forbid_matrix)
-        logger.info("计算成功 taskID=%s inputHash=%s 最终SC数量=%s", task_id, input_hash[:16], res_data['data']['total_SC_used'])
+        validate_output_result(
+            res_data, company_yingji_name, max_weight_per_sc, max_length_per_sc, zjdh_forbid_matrix,
+            raw_boxes_by_sc=raw_boxes_by_sc,
+        )
+        logger.info("计算成功 taskID=%s 最终SC数量=%s", task_id, res_data['data']['total_SC_used'])
         return res_data
     except AlgorithmError as exc:
         logger.warning(
-            "算法执行失败 taskID=%s inputHash=%s organizationID=%s，具体原因: %s",
-            task_id, input_hash[:16], current_organization_id, exc, exc_info=True,
+            "算法执行失败 taskID=%s organizationID=%s，具体原因: %s",
+            task_id, current_organization_id, exc, exc_info=True,
         )
         return {"code": 1, "msg": f"算法执行失败：{exc}"}
     except Exception as exc:
         logger.exception(
-            "算法执行失败 taskID=%s inputHash=%s organizationID=%s，具体原因: %s",
-            task_id, input_hash[:16], current_organization_id, exc,
+            "算法执行失败 taskID=%s organizationID=%s，具体原因: %s",
+            task_id, current_organization_id, exc,
         )
         return {"code": 1, "msg": f"算法执行失败：{exc}，请查看日志"}
 
 
-def validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max_length_per_sc, zjdh_forbid_matrix=None):
+def validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max_length_per_sc,
+                           zjdh_forbid_matrix=None, *, raw_boxes_by_sc=None):
     for sc in res_data.get('data', {}).get('SC_list', []):
         sid = sc.get('SC_ID', '')
         summary = sc.get('summary', {})
@@ -4619,15 +4621,20 @@ def validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max
         total_l = sum(safe_float(box.get('length_unit'), 0.0) for box in box_list)
         summary_w = safe_float(summary.get('total_weight', total_w), total_w)
         summary_l = safe_float(summary.get('total_length_unit', total_l), total_l)
+        raw_boxes = raw_boxes_by_sc.get(sid) if raw_boxes_by_sc is not None else None
+        # 原始容量与展示汇总分别校验，保持真实载重和换长约束。
+        capacity_w = sum(w for w, _ in raw_boxes) if raw_boxes is not None else total_w
+        capacity_l = sum(l for _, l in raw_boxes) if raw_boxes is not None else total_l
 
-        if total_w > max_weight_per_sc + 1e-6:
-            raise AlgorithmError(f"{sid} 出参校验超重: {total_w:.1f} > {max_weight_per_sc:.1f}")
-        if total_l > max_length_per_sc + 1e-6:
-            raise AlgorithmError(f"{sid} 出参校验超换长: {total_l:.2f} > {max_length_per_sc:.2f}")
-        if summary_w > max_weight_per_sc + 1e-6:
-            raise AlgorithmError(f"{sid} summary超重: {summary_w:.1f} > {max_weight_per_sc:.1f}")
-        if summary_l > max_length_per_sc + 1e-6:
-            raise AlgorithmError(f"{sid} summary超换长: {summary_l:.2f} > {max_length_per_sc:.2f}")
+        if capacity_w > max_weight_per_sc + 1e-6:
+            raise AlgorithmError(f"{sid} 出参校验超重: {capacity_w:.1f} > {max_weight_per_sc:.1f}")
+        if capacity_l > max_length_per_sc + 1e-6:
+            raise AlgorithmError(f"{sid} 出参校验超换长: {capacity_l:.2f} > {max_length_per_sc:.2f}")
+        if raw_boxes is None:
+            if summary_w > max_weight_per_sc + 1e-6:
+                raise AlgorithmError(f"{sid} summary超重: {summary_w:.1f} > {max_weight_per_sc:.1f}")
+            if summary_l > max_length_per_sc + 1e-6:
+                raise AlgorithmError(f"{sid} summary超换长: {summary_l:.2f} > {max_length_per_sc:.2f}")
         if abs(summary_w - total_w) > 0.2 or abs(summary_l - total_l) > 0.02:
             raise AlgorithmError(
                 f"{sid} summary与box_list汇总不一致: "
@@ -4637,10 +4644,13 @@ def validate_output_result(res_data, company_yingji_name, max_weight_per_sc, max
 
         used_yingji_names = set()
         owners_from_boxes = set()
-        for box in box_list:
-            if safe_float(box.get('weight'), 0.0) > max_weight_per_sc + 1e-6:
+        for box_index, box in enumerate(box_list):
+            box_w, box_l = raw_boxes[box_index] if raw_boxes is not None else (
+                safe_float(box.get('weight'), 0.0), safe_float(box.get('length_unit'), 0.0)
+            )
+            if box_w > max_weight_per_sc + 1e-6:
                 raise AlgorithmError(f"{sid} 存在单箱超重: box_id={box.get('box_id')}")
-            if safe_float(box.get('length_unit'), 0.0) > max_length_per_sc + 1e-6:
+            if box_l > max_length_per_sc + 1e-6:
                 raise AlgorithmError(f"{sid} 存在单箱超换长: box_id={box.get('box_id')}")
             for cid in box.get('owners', []) or []:
                 owners_from_boxes.add(cid)
@@ -4908,14 +4918,6 @@ async def optimize(req: OptimizationRequest, request: Request):
     except Exception as exc:
         logger.warning("[%s] 请求格式转换失败: %s", request_id, exc)
         raise HTTPException(status_code=400, detail=f"请求格式错误: {exc}")
-
-    payload_task_id = resolve_task_id(payload)
-    payload_hash = input_fingerprint(payload)
-    payload_organization_ids = [comp.get('organizationID', '') for comp in payload.get('data', [])]
-    logger.info(
-        "[%s] 请求解析完成 taskID=%s inputHash=%s organizationID=%s",
-        request_id, payload_task_id, payload_hash[:16], payload_organization_ids,
-    )
 
     if not ALGO_GATE.acquire(blocking=False):
         logger.warning("[%s] worker 全部繁忙，拒绝请求", request_id)
